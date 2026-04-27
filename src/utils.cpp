@@ -521,6 +521,53 @@ void Utils::sbgemv(Precision p, const void *d_mat, const void *d_vec_in, void *d
     }
 }
 
+template <Precision P>
+void sbgemm_impl(const typename TypeTraits<P>::Complex *d_A,
+                 const typename TypeTraits<P>::Complex *d_B,
+                 typename TypeTraits<P>::Complex *d_C,
+                 int m, int n, int k, int batch_count,
+                 cublasHandle_t handle, cudaStream_t s)
+{
+    using T_complex = typename TypeTraits<P>::Complex;
+
+    const T_complex alpha = TypeTraits<P>::one();
+    const T_complex beta = TypeTraits<P>::zero();
+
+    cublasSetStream(handle, s);
+
+    cublasSafeCall(TypeTraits<P>::blasSBgemm(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        m, n, k,
+        &alpha,
+        d_A, m, static_cast<long long int>(m) * k,
+        d_B, k, static_cast<long long int>(k) * n,
+        &beta,
+        d_C, m, static_cast<long long int>(m) * n,
+        batch_count));
+}
+
+template void sbgemm_impl<Precision::SINGLE>(const ComplexF *, const ComplexF *, ComplexF *, int, int, int, int, cublasHandle_t, cudaStream_t);
+template void sbgemm_impl<Precision::DOUBLE>(const ComplexD *, const ComplexD *, ComplexD *, int, int, int, int, cublasHandle_t, cudaStream_t);
+
+void Utils::sbgemm(Precision p, const void *d_A, const void *d_B, void *d_C,
+                   int m, int n, int k, int batch_count,
+                   cublasHandle_t handle, cudaStream_t s)
+{
+    if (p == Precision::SINGLE)
+    {
+        sbgemm_impl<Precision::SINGLE>(
+            static_cast<const ComplexF *>(d_A), static_cast<const ComplexF *>(d_B),
+            static_cast<ComplexF *>(d_C), m, n, k, batch_count, handle, s);
+    }
+    else
+    {
+        sbgemm_impl<Precision::DOUBLE>(
+            static_cast<const ComplexD *>(d_A), static_cast<const ComplexD *>(d_B),
+            static_cast<ComplexD *>(d_C), m, n, k, batch_count, handle, s);
+    }
+}
+
 
 // Function to hash a 64-bit integer
 uint64_t hash_index(uint64_t i) {

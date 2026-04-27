@@ -65,6 +65,28 @@ struct TypeTraits<Precision::SINGLE>
     }
 
     /**
+     * @brief Explicit wrapper for cublasCgemmStridedBatched.
+     */
+    static cublasStatus_t blasSBgemm(cublasHandle_t handle, cublasOperation_t transa,
+                                       cublasOperation_t transb, int m, int n, int k,
+                                       const Complex *alpha, const Complex *A, int lda,
+                                       long long int strideA, const Complex *B, int ldb,
+                                       long long int strideB, const Complex *beta,
+                                       Complex *C, int ldc, long long int strideC,
+                                       int batch_count)
+    {
+#if !INDICES_64_BIT
+        return cublasCgemmStridedBatched(handle, transa, transb, m, n, k, alpha,
+                                         A, lda, strideA, B, ldb, strideB,
+                                         beta, C, ldc, strideC, batch_count);
+#else
+        return cublasCgemmStridedBatched_64(handle, transa, transb, m, n, k, alpha,
+                                            A, lda, strideA, B, ldb, strideB,
+                                            beta, C, ldc, strideC, batch_count);
+#endif
+    }
+
+    /**
      * @brief Explicit wrapper for cublasCgeam (Matrix-Matrix Transpose/Addition).
      */
     static cublasStatus_t blasGeam(cublasHandle_t handle, cublasOperation_t transa,
@@ -118,6 +140,28 @@ struct TypeTraits<Precision::DOUBLE>
         return cublasZgemvStridedBatched_64(handle, trans, m, n, alpha, A, lda, strideA,
                                             x, incx, stridex, beta, y, incy, stridey,
                                             batch_count);
+#endif
+    }
+
+    /**
+     * @brief Explicit wrapper for cublasZgemmStridedBatched.
+     */
+    static cublasStatus_t blasSBgemm(cublasHandle_t handle, cublasOperation_t transa,
+                                       cublasOperation_t transb, int m, int n, int k,
+                                       const Complex *alpha, const Complex *A, int lda,
+                                       long long int strideA, const Complex *B, int ldb,
+                                       long long int strideB, const Complex *beta,
+                                       Complex *C, int ldc, long long int strideC,
+                                       int batch_count)
+    {
+#if !INDICES_64_BIT
+        return cublasZgemmStridedBatched(handle, transa, transb, m, n, k, alpha,
+                                         A, lda, strideA, B, ldb, strideB,
+                                         beta, C, ldc, strideC, batch_count);
+#else
+        return cublasZgemmStridedBatched_64(handle, transa, transb, m, n, k, alpha,
+                                            A, lda, strideA, B, ldb, strideB,
+                                            beta, C, ldc, strideC, batch_count);
 #endif
     }
 

@@ -62,6 +62,35 @@ void sbgemv_cpu(const std::vector<T_complex>& mat, const std::vector<T_complex>&
         }
     }
 }
+
+/**
+ * @brief CPU equivalent of strided batched GEMM, assuming COLUMN-MAJOR matrix storage.
+ */
+template<typename T_complex>
+void sbgemm_cpu(const std::vector<T_complex>& A, const std::vector<T_complex>& B,
+                std::vector<T_complex>& C, int m, int n, int k, int batch_count)
+{
+    C.assign(static_cast<size_t>(batch_count) * m * n, T_complex{0.0f, 0.0f});
+
+    for (int batch = 0; batch < batch_count; ++batch) {
+        const T_complex* A_batch = &A[static_cast<size_t>(batch) * m * k];
+        const T_complex* B_batch = &B[static_cast<size_t>(batch) * k * n];
+        T_complex* C_batch = &C[static_cast<size_t>(batch) * m * n];
+
+        for (int col = 0; col < n; ++col) {
+            for (int row = 0; row < m; ++row) {
+                T_complex sum{0.0f, 0.0f};
+                for (int inner = 0; inner < k; ++inner) {
+                    const T_complex A_val = A_batch[inner * m + row];
+                    const T_complex B_val = B_batch[col * k + inner];
+                    sum.x += A_val.x * B_val.x - A_val.y * B_val.y;
+                    sum.y += A_val.x * B_val.y + A_val.y * B_val.x;
+                }
+                C_batch[col * m + row] = sum;
+            }
+        }
+    }
+}
 //============================================================================//
 //               TEST FIXTURE FOR COMPLEX-VALUED UTILS                        //
 //============================================================================//
@@ -324,4 +353,51 @@ TYPED_TEST(UtilComplexKernelsTest, Sbgemv) {
         cudaFree(this->d_vec_in); this->d_vec_in = nullptr;
         cudaFree(this->d_vec_out); this->d_vec_out = nullptr;
     }
+}
+
+TYPED_TEST(UtilComplexKernelsTest, Sbgemm) {
+    using T_complex = TypeParam;
+    constexpr Precision P = (std::is_same_v<T_complex, ComplexF>) ? Precision::SINGLE : Precision::DOUBLE;
+
+    const int m = 5;
+    const int n = 4;
+    const int k = 3;
+    const int batch_count = 6;
+    const size_t A_count = static_cast<size_t>(batch_count) * m * k;
+    const size_t B_count = static_cast<size_t>(batch_count) * k * n;
+    const size_t C_count = static_cast<size_t>(batch_count) * m * n;
+
+    gpuErrchk(cudaMalloc(&this->d_mat, A_count * sizeof(T_complex)));
+    gpuErrchk(cudaMalloc(&this->d_vec_in, B_count * sizeof(T_complex)));
+    gpuErrchk(cudaMalloc(&this->d_vec_out, C_count * sizeof(T_complex)));
+    cublasCreate(&this->handle);
+
+    std::vector<T_complex> h_A(A_count);
+    std::vector<T_complex> h_B(B_count);
+    for (size_t i = 0; i < A_count; ++i) h_A[i] = make_complex_from_int<T_complex>(i + 1);
+    for (size_t i = 0; i < B_count; ++i) h_B[i] = make_complex_from_int<T_complex>(2 * i + 1);
+
+    gpuErrchk(cudaMemcpy(this->d_mat, h_A.data(), A_count * sizeof(T_complex), cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(this->d_vec_in, h_B.data(), B_count * sizeof(T_complex), cudaMemcpyHostToDevice));
+
+    Utils::sbgemm(P, this->d_mat, this->d_vec_in, this->d_vec_out,
+                  m, n, k, batch_count, this->handle, nullptr);
+
+    std::vector<T_complex> h_gpu_out(C_count);
+    gpuErrchk(cudaMemcpy(h_gpu_out.data(), this->d_vec_out, C_count * sizeof(T_complex), cudaMemcpyDeviceToHost));
+
+    std::vector<T_complex> h_expected;
+    sbgemm_cpu(h_A, h_B, h_expected, m, n, k, batch_count);
+
+    for (size_t i = 0; i < C_count; ++i) {
+        if (std::is_same_v<T_complex, ComplexF>) {
+            ASSERT_NEAR(h_gpu_out[i].x, h_expected[i].x, 1e-3);
+            ASSERT_NEAR(h_gpu_out[i].y, h_expected[i].y, 1e-3);
+        } else {
+            ASSERT_NEAR(h_gpu_out[i].x, h_expected[i].x, 1e-9);
+            ASSERT_NEAR(h_gpu_out[i].y, h_expected[i].y, 1e-9);
+        }
+    }
+
+    cublasDestroy(this->handle);
 }

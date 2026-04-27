@@ -199,9 +199,30 @@ namespace Utils
     void sbgemv(Precision p, const void *d_mat, const void *d_vec_in, void *d_vec_out, int num_rows, int num_cols, int block_size, bool conjugate, cublasHandle_t handle, cudaStream_t s);
 
     /**
+     * @brief Perform a strided batched matrix-matrix multiplication.
+     *
+     * Computes C_i = A_i * B_i for each batch i. Matrices use cuBLAS
+     * column-major storage with A_i in R/C^(m x k), B_i in R/C^(k x n),
+     * and C_i in R/C^(m x n).
+     *
+     * @param p The precision of the input and output matrices.
+     * @param d_A Pointer to the input A matrices.
+     * @param d_B Pointer to the input B matrices.
+     * @param d_C Pointer to the output C matrices.
+     * @param m The number of rows in A and C.
+     * @param n The number of columns in B and C.
+     * @param k The number of columns in A and rows in B.
+     * @param batch_count The number of matrix products.
+     * @param handle The cuBLAS handle to use for the operation.
+     * @param s The CUDA stream to use for the operation.
+     */
+    void sbgemm(Precision p, const void *d_A, const void *d_B, void *d_C,
+                int m, int n, int k, int batch_count, cublasHandle_t handle, cudaStream_t s);
+
+    /**
      * @brief Generates a deterministic double from a 64-bit integer.
      * @param i The 64-bit integer.
-     *  
+     *
      * */   
     double generate_double(uint64_t i);
 
