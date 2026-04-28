@@ -31,6 +31,17 @@ public:
         cudaStream_t stream = 0);
 
     /**
+     * @brief Compute a truncated matrix-polynomial product on one GPU.
+     *
+     * Returns left(t) * right(t) modulo t^out_len. Inputs use the same
+     * coefficient-major, column-major block layout as invert_newton_gpu.
+     */
+    static std::vector<double> multiply_truncated_gpu(
+        const std::vector<double> &left, int left_len,
+        const std::vector<double> &right, int right_len,
+        int out_len, int block_dim, int fft_len, cudaStream_t stream = 0);
+
+    /**
      * @brief Frobenius norm of A * H - I modulo t^num_blocks.
      */
     static double residual_norm(
@@ -44,11 +55,6 @@ public:
 
 private:
     static std::vector<double> invert_block_cpu(const double *block, int block_dim);
-
-    static std::vector<double> multiply_truncated_gpu(
-        const std::vector<double> &left, int left_len,
-        const std::vector<double> &right, int right_len,
-        int out_len, int block_dim, int fft_len, cudaStream_t stream);
 };
 
 #endif // __BLOCK_TOEPLITZ_INVERSE_HPP__

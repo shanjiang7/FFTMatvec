@@ -186,6 +186,8 @@ std::vector<double> BlockToeplitzInverse::multiply_truncated_gpu(
 {
     if (left_len <= 0 || right_len <= 0 || out_len <= 0)
         throw std::invalid_argument("Polynomial lengths must be positive.");
+    if (out_len > fft_len)
+        throw std::invalid_argument("out_len must be no larger than fft_len.");
     if (fft_len < left_len + right_len - 1)
         throw std::invalid_argument("fft_len is too small for the requested product.");
 
@@ -255,54 +257,18 @@ std::vector<double> BlockToeplitzInverse::multiply_truncated_gpu(
 
     cufftSafeCall(cufftExecD2Z(forward_plan, d_left_real, d_left_freq_entry));
     cufftSafeCall(cufftExecD2Z(forward_plan, d_right_real, d_right_freq_entry));
-    gpuErrchk(cudaStreamSynchronize(stream));
-
-    std::vector<ComplexD> h_left_freq_entry(freq_count);
-    std::vector<ComplexD> h_right_freq_entry(freq_count);
-    std::vector<ComplexD> h_left_freq_major(freq_major_count);
-    std::vector<ComplexD> h_right_freq_major(freq_major_count);
-    gpuErrchk(cudaMemcpy(h_left_freq_entry.data(), d_left_freq_entry,
-                         freq_count * sizeof(ComplexD), cudaMemcpyDeviceToHost));
-    gpuErrchk(cudaMemcpy(h_right_freq_entry.data(), d_right_freq_entry,
-                         freq_count * sizeof(ComplexD), cudaMemcpyDeviceToHost));
-
-    for (int freq = 0; freq < freq_len; ++freq)
-    {
-        for (int e = 0; e < entries; ++e)
-        {
-            h_left_freq_major[static_cast<size_t>(freq) * entries + e] =
-                h_left_freq_entry[static_cast<size_t>(e) * freq_len + freq];
-            h_right_freq_major[static_cast<size_t>(freq) * entries + e] =
-                h_right_freq_entry[static_cast<size_t>(e) * freq_len + freq];
-        }
-    }
-
-    gpuErrchk(cudaMemcpy(d_left_freq_major, h_left_freq_major.data(),
-                         freq_major_count * sizeof(ComplexD), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(d_right_freq_major, h_right_freq_major.data(),
-                         freq_major_count * sizeof(ComplexD), cudaMemcpyHostToDevice));
 
     cublasSafeCall(cublasCreate(&cublas_handle));
+    Utils::transpose_2d(Precision::DOUBLE, d_left_freq_entry, d_left_freq_major,
+                        freq_len, entries, cublas_handle, stream);
+    Utils::transpose_2d(Precision::DOUBLE, d_right_freq_entry, d_right_freq_major,
+                        freq_len, entries, cublas_handle, stream);
+
     Utils::sbgemm(Precision::DOUBLE, d_left_freq_major, d_right_freq_major, d_out_freq_major,
                   block_dim, block_dim, block_dim, freq_len, cublas_handle, stream);
-    gpuErrchk(cudaStreamSynchronize(stream));
+    Utils::transpose_2d(Precision::DOUBLE, d_out_freq_major, d_out_freq_entry,
+                        entries, freq_len, cublas_handle, stream);
 
-    std::vector<ComplexD> h_out_freq_major(freq_major_count);
-    std::vector<ComplexD> h_out_freq_entry(freq_count);
-    gpuErrchk(cudaMemcpy(h_out_freq_major.data(), d_out_freq_major,
-                         freq_major_count * sizeof(ComplexD), cudaMemcpyDeviceToHost));
-
-    for (int freq = 0; freq < freq_len; ++freq)
-    {
-        for (int e = 0; e < entries; ++e)
-        {
-            h_out_freq_entry[static_cast<size_t>(e) * freq_len + freq] =
-                h_out_freq_major[static_cast<size_t>(freq) * entries + e];
-        }
-    }
-
-    gpuErrchk(cudaMemcpy(d_out_freq_entry, h_out_freq_entry.data(),
-                         freq_count * sizeof(ComplexD), cudaMemcpyHostToDevice));
     cufftSafeCall(cufftExecZ2D(inverse_plan, d_out_freq_entry, d_out_real));
     gpuErrchk(cudaStreamSynchronize(stream));
 

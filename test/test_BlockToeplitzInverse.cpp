@@ -55,6 +55,94 @@ double max_abs_diff(const std::vector<double> &a, const std::vector<double> &b)
         max_diff = std::max(max_diff, std::abs(a[i] - b[i]));
     return max_diff;
 }
+
+bool cuda_available()
+{
+    int device_count = 0;
+    const cudaError_t device_err = cudaGetDeviceCount(&device_count);
+    return device_err == cudaSuccess && device_count > 0;
+}
+
+std::vector<double> make_polynomial(int num_blocks, int block_dim, double offset)
+{
+    const int entries = block_dim * block_dim;
+    std::vector<double> blocks(static_cast<size_t>(num_blocks) * entries, 0.0);
+
+    for (int t = 0; t < num_blocks; ++t)
+    {
+        for (int col = 0; col < block_dim; ++col)
+        {
+            for (int row = 0; row < block_dim; ++row)
+            {
+                const double val = 0.04 * std::sin(offset + 0.9 * (t + 1) * (row + 1)) +
+                                   0.03 * std::cos(offset + 0.5 * (t + 2) * (col + 1));
+                blocks[block_entry(t, entries, cm_entry(row, col, block_dim))] = val;
+            }
+        }
+    }
+
+    return blocks;
+}
+
+void block_gemm_cpu(const double *A, const double *B, double *C, int block_dim)
+{
+    for (int col = 0; col < block_dim; ++col)
+    {
+        for (int row = 0; row < block_dim; ++row)
+        {
+            double sum = 0.0;
+            for (int inner = 0; inner < block_dim; ++inner)
+            {
+                sum += A[cm_entry(row, inner, block_dim)] *
+                       B[cm_entry(inner, col, block_dim)];
+            }
+            C[cm_entry(row, col, block_dim)] = sum;
+        }
+    }
+}
+
+std::vector<double> multiply_truncated_cpu(const std::vector<double> &left, int left_len,
+                                           const std::vector<double> &right, int right_len,
+                                           int out_len, int block_dim)
+{
+    const int entries = block_dim * block_dim;
+    std::vector<double> out(static_cast<size_t>(out_len) * entries, 0.0);
+    std::vector<double> tmp(entries, 0.0);
+
+    for (int k = 0; k < out_len; ++k)
+    {
+        for (int i = 0; i <= k; ++i)
+        {
+            const int j = k - i;
+            if (i >= left_len || j >= right_len)
+                continue;
+
+            block_gemm_cpu(left.data() + block_entry(i, entries, 0),
+                           right.data() + block_entry(j, entries, 0),
+                           tmp.data(), block_dim);
+            for (int e = 0; e < entries; ++e)
+                out[block_entry(k, entries, e)] += tmp[e];
+        }
+    }
+
+    return out;
+}
+
+void expect_polynomial_multiply_matches_cpu(int left_len, int right_len, int out_len,
+                                            int block_dim, double tolerance)
+{
+    const std::vector<double> left = make_polynomial(left_len, block_dim, 0.2);
+    const std::vector<double> right = make_polynomial(right_len, block_dim, 1.1);
+    const int fft_len = BlockToeplitzInverse::next_pow2(left_len + right_len - 1);
+
+    const std::vector<double> expected =
+        multiply_truncated_cpu(left, left_len, right, right_len, out_len, block_dim);
+    const std::vector<double> actual =
+        BlockToeplitzInverse::multiply_truncated_gpu(
+            left, left_len, right, right_len, out_len, block_dim, fft_len);
+
+    ASSERT_LT(max_abs_diff(expected, actual), tolerance);
+}
 } // namespace
 
 TEST(BlockToeplitzInverseTest, NextPow2)
@@ -77,11 +165,33 @@ TEST(BlockToeplitzInverseTest, CpuReferenceResidual)
     ASSERT_LT(BlockToeplitzInverse::residual_norm(A, H, num_blocks, block_dim), 1e-11);
 }
 
+TEST(BlockToeplitzInverseTest, PolynomialMultiplyScalarTruncated)
+{
+    if (!cuda_available())
+        GTEST_SKIP() << "CUDA device is not available.";
+
+    expect_polynomial_multiply_matches_cpu(5, 4, 4, 1, 1e-10);
+}
+
+TEST(BlockToeplitzInverseTest, PolynomialMultiplyUnequalLengths)
+{
+    if (!cuda_available())
+        GTEST_SKIP() << "CUDA device is not available.";
+
+    expect_polynomial_multiply_matches_cpu(3, 5, 7, 2, 1e-10);
+}
+
+TEST(BlockToeplitzInverseTest, PolynomialMultiplyMatrixBlocks)
+{
+    if (!cuda_available())
+        GTEST_SKIP() << "CUDA device is not available.";
+
+    expect_polynomial_multiply_matches_cpu(4, 3, 5, 4, 1e-10);
+}
+
 TEST(BlockToeplitzInverseTest, GpuNewtonMatchesCpuReference)
 {
-    int device_count = 0;
-    const cudaError_t device_err = cudaGetDeviceCount(&device_count);
-    if (device_err != cudaSuccess || device_count == 0)
+    if (!cuda_available())
         GTEST_SKIP() << "CUDA device is not available.";
 
     const int num_blocks = 8;
@@ -99,9 +209,7 @@ TEST(BlockToeplitzInverseTest, GpuNewtonMatchesCpuReference)
 
 TEST(BlockToeplitzInverseTest, ScalarToeplitzGpuNewton)
 {
-    int device_count = 0;
-    const cudaError_t device_err = cudaGetDeviceCount(&device_count);
-    if (device_err != cudaSuccess || device_count == 0)
+    if (!cuda_available())
         GTEST_SKIP() << "CUDA device is not available.";
 
     const int num_blocks = 16;
