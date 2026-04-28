@@ -27,6 +27,7 @@ set(FFT_MVEC_CUDA_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/Comm.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/Matrix.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/Vector.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/BlockToeplitzInverse.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tester.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/util_kernels.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/error_checkers.h"
@@ -42,6 +43,7 @@ set(FFT_MVEC_CUDA_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/Comm.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/Matrix.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/Vector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/BlockToeplitzInverse.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tester.cpp"
 )
 
