@@ -2,6 +2,7 @@
 #include "utils.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -57,6 +58,51 @@ void block_gemm_cpu(const double *A, const double *B, double *C, int block_dim,
             C[idx] = alpha * sum + beta * C[idx];
         }
     }
+}
+
+template <typename Func>
+double measure_cpu_ms(Func &&func)
+{
+    const auto start = std::chrono::steady_clock::now();
+    func();
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count();
+}
+
+template <typename Func>
+double measure_gpu_ms(cudaStream_t stream, Func &&func)
+{
+    cudaEvent_t start, stop;
+    gpuErrchk(cudaEventCreate(&start));
+    gpuErrchk(cudaEventCreate(&stop));
+    gpuErrchk(cudaEventRecord(start, stream));
+    func();
+    gpuErrchk(cudaEventRecord(stop, stream));
+    gpuErrchk(cudaEventSynchronize(stop));
+    float elapsed_ms = 0.0f;
+    gpuErrchk(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    gpuErrchk(cudaEventDestroy(start));
+    gpuErrchk(cudaEventDestroy(stop));
+    return static_cast<double>(elapsed_ms);
+}
+
+void accumulate_multiply_profile(BlockToeplitzMultiplyProfile &dst,
+                                 const BlockToeplitzMultiplyProfile &src)
+{
+    dst.total_ms += src.total_ms;
+    dst.host_pack_ms += src.host_pack_ms;
+    dst.cuda_alloc_ms += src.cuda_alloc_ms;
+    dst.h2d_copy_ms += src.h2d_copy_ms;
+    dst.cufft_plan_ms += src.cufft_plan_ms;
+    dst.cublas_create_ms += src.cublas_create_ms;
+    dst.forward_fft_ms += src.forward_fft_ms;
+    dst.transpose_to_freq_major_ms += src.transpose_to_freq_major_ms;
+    dst.sbgemm_ms += src.sbgemm_ms;
+    dst.transpose_to_entry_major_ms += src.transpose_to_entry_major_ms;
+    dst.inverse_fft_ms += src.inverse_fft_ms;
+    dst.d2h_copy_ms += src.d2h_copy_ms;
+    dst.scale_truncate_ms += src.scale_truncate_ms;
+    dst.cleanup_ms += src.cleanup_ms;
 }
 
 } // namespace
@@ -182,8 +228,13 @@ std::vector<double> BlockToeplitzInverse::invert_cpu_reference(
 std::vector<double> BlockToeplitzInverse::multiply_truncated_gpu(
     const std::vector<double> &left, int left_len,
     const std::vector<double> &right, int right_len,
-    int out_len, int block_dim, int fft_len, cudaStream_t stream)
+    int out_len, int block_dim, int fft_len, cudaStream_t stream,
+    BlockToeplitzMultiplyProfile *profile)
 {
+    const auto total_start = std::chrono::steady_clock::now();
+    if (profile)
+        *profile = BlockToeplitzMultiplyProfile{};
+
     if (left_len <= 0 || right_len <= 0 || out_len <= 0)
         throw std::invalid_argument("Polynomial lengths must be positive.");
     if (out_len > fft_len)
@@ -203,21 +254,29 @@ std::vector<double> BlockToeplitzInverse::multiply_truncated_gpu(
     const size_t freq_count = static_cast<size_t>(entries) * freq_len;
     const size_t freq_major_count = static_cast<size_t>(freq_len) * entries;
 
-    std::vector<double> h_left_real(real_count, 0.0);
-    std::vector<double> h_right_real(real_count, 0.0);
+    std::vector<double> h_left_real;
+    std::vector<double> h_right_real;
+    const auto pack = [&]() {
+        h_left_real.assign(real_count, 0.0);
+        h_right_real.assign(real_count, 0.0);
 
-    for (int t = 0; t < left_len; ++t)
-    {
-        for (int e = 0; e < entries; ++e)
-            h_left_real[static_cast<size_t>(e) * fft_len + t] =
-                left[block_entry(t, entries, e)];
-    }
-    for (int t = 0; t < right_len; ++t)
-    {
-        for (int e = 0; e < entries; ++e)
-            h_right_real[static_cast<size_t>(e) * fft_len + t] =
-                right[block_entry(t, entries, e)];
-    }
+        for (int t = 0; t < left_len; ++t)
+        {
+            for (int e = 0; e < entries; ++e)
+                h_left_real[static_cast<size_t>(e) * fft_len + t] =
+                    left[block_entry(t, entries, e)];
+        }
+        for (int t = 0; t < right_len; ++t)
+        {
+            for (int e = 0; e < entries; ++e)
+                h_right_real[static_cast<size_t>(e) * fft_len + t] =
+                    right[block_entry(t, entries, e)];
+        }
+    };
+    if (profile)
+        profile->host_pack_ms = measure_cpu_ms(pack);
+    else
+        pack();
 
     double *d_left_real = nullptr;
     double *d_right_real = nullptr;
@@ -232,93 +291,202 @@ std::vector<double> BlockToeplitzInverse::multiply_truncated_gpu(
     cufftHandle inverse_plan;
     cublasHandle_t cublas_handle = nullptr;
 
-    gpuErrchk(cudaMalloc((void **)&d_left_real, real_count * sizeof(double)));
-    gpuErrchk(cudaMalloc((void **)&d_right_real, real_count * sizeof(double)));
-    gpuErrchk(cudaMalloc((void **)&d_out_real, real_count * sizeof(double)));
-    gpuErrchk(cudaMalloc((void **)&d_left_freq_entry, freq_count * sizeof(ComplexD)));
-    gpuErrchk(cudaMalloc((void **)&d_right_freq_entry, freq_count * sizeof(ComplexD)));
-    gpuErrchk(cudaMalloc((void **)&d_out_freq_entry, freq_count * sizeof(ComplexD)));
-    gpuErrchk(cudaMalloc((void **)&d_left_freq_major, freq_major_count * sizeof(ComplexD)));
-    gpuErrchk(cudaMalloc((void **)&d_right_freq_major, freq_major_count * sizeof(ComplexD)));
-    gpuErrchk(cudaMalloc((void **)&d_out_freq_major, freq_major_count * sizeof(ComplexD)));
+    const auto allocate = [&]() {
+        gpuErrchk(cudaMalloc((void **)&d_left_real, real_count * sizeof(double)));
+        gpuErrchk(cudaMalloc((void **)&d_right_real, real_count * sizeof(double)));
+        gpuErrchk(cudaMalloc((void **)&d_out_real, real_count * sizeof(double)));
+        gpuErrchk(cudaMalloc((void **)&d_left_freq_entry, freq_count * sizeof(ComplexD)));
+        gpuErrchk(cudaMalloc((void **)&d_right_freq_entry, freq_count * sizeof(ComplexD)));
+        gpuErrchk(cudaMalloc((void **)&d_out_freq_entry, freq_count * sizeof(ComplexD)));
+        gpuErrchk(cudaMalloc((void **)&d_left_freq_major, freq_major_count * sizeof(ComplexD)));
+        gpuErrchk(cudaMalloc((void **)&d_right_freq_major, freq_major_count * sizeof(ComplexD)));
+        gpuErrchk(cudaMalloc((void **)&d_out_freq_major, freq_major_count * sizeof(ComplexD)));
+    };
+    if (profile)
+        profile->cuda_alloc_ms = measure_cpu_ms(allocate);
+    else
+        allocate();
 
-    gpuErrchk(cudaMemcpy(d_left_real, h_left_real.data(), real_count * sizeof(double),
-                         cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(d_right_real, h_right_real.data(), real_count * sizeof(double),
-                         cudaMemcpyHostToDevice));
+    const auto h2d_copy = [&]() {
+        gpuErrchk(cudaMemcpy(d_left_real, h_left_real.data(), real_count * sizeof(double),
+                             cudaMemcpyHostToDevice));
+        gpuErrchk(cudaMemcpy(d_right_real, h_right_real.data(), real_count * sizeof(double),
+                             cudaMemcpyHostToDevice));
+    };
+    if (profile)
+        profile->h2d_copy_ms = measure_cpu_ms(h2d_copy);
+    else
+        h2d_copy();
 
     int n[1] = {fft_len};
-    cufftSafeCall(cufftPlanMany(&forward_plan, 1, n, nullptr, 1, fft_len, nullptr, 1,
-                                freq_len, CUFFT_D2Z, entries));
-    cufftSafeCall(cufftPlanMany(&inverse_plan, 1, n, nullptr, 1, freq_len, nullptr, 1,
-                                fft_len, CUFFT_Z2D, entries));
-    cufftSafeCall(cufftSetStream(forward_plan, stream));
-    cufftSafeCall(cufftSetStream(inverse_plan, stream));
+    const auto plan_fft = [&]() {
+        cufftSafeCall(cufftPlanMany(&forward_plan, 1, n, nullptr, 1, fft_len, nullptr, 1,
+                                    freq_len, CUFFT_D2Z, entries));
+        cufftSafeCall(cufftPlanMany(&inverse_plan, 1, n, nullptr, 1, freq_len, nullptr, 1,
+                                    fft_len, CUFFT_Z2D, entries));
+        cufftSafeCall(cufftSetStream(forward_plan, stream));
+        cufftSafeCall(cufftSetStream(inverse_plan, stream));
+    };
+    if (profile)
+        profile->cufft_plan_ms = measure_cpu_ms(plan_fft);
+    else
+        plan_fft();
 
-    cufftSafeCall(cufftExecD2Z(forward_plan, d_left_real, d_left_freq_entry));
-    cufftSafeCall(cufftExecD2Z(forward_plan, d_right_real, d_right_freq_entry));
+    const auto create_cublas = [&]() {
+        cublasSafeCall(cublasCreate(&cublas_handle));
+    };
+    if (profile)
+        profile->cublas_create_ms = measure_cpu_ms(create_cublas);
+    else
+        create_cublas();
 
-    cublasSafeCall(cublasCreate(&cublas_handle));
-    Utils::transpose_2d(Precision::DOUBLE, d_left_freq_entry, d_left_freq_major,
-                        freq_len, entries, cublas_handle, stream);
-    Utils::transpose_2d(Precision::DOUBLE, d_right_freq_entry, d_right_freq_major,
-                        freq_len, entries, cublas_handle, stream);
+    const auto forward_fft = [&]() {
+        cufftSafeCall(cufftExecD2Z(forward_plan, d_left_real, d_left_freq_entry));
+        cufftSafeCall(cufftExecD2Z(forward_plan, d_right_real, d_right_freq_entry));
+    };
+    if (profile)
+        profile->forward_fft_ms = measure_gpu_ms(stream, forward_fft);
+    else
+        forward_fft();
 
-    Utils::sbgemm(Precision::DOUBLE, d_left_freq_major, d_right_freq_major, d_out_freq_major,
-                  block_dim, block_dim, block_dim, freq_len, cublas_handle, stream);
-    Utils::transpose_2d(Precision::DOUBLE, d_out_freq_major, d_out_freq_entry,
-                        entries, freq_len, cublas_handle, stream);
+    const auto transpose_to_freq_major = [&]() {
+        Utils::transpose_2d(Precision::DOUBLE, d_left_freq_entry, d_left_freq_major,
+                            freq_len, entries, cublas_handle, stream);
+        Utils::transpose_2d(Precision::DOUBLE, d_right_freq_entry, d_right_freq_major,
+                            freq_len, entries, cublas_handle, stream);
+    };
+    if (profile)
+        profile->transpose_to_freq_major_ms =
+            measure_gpu_ms(stream, transpose_to_freq_major);
+    else
+        transpose_to_freq_major();
 
-    cufftSafeCall(cufftExecZ2D(inverse_plan, d_out_freq_entry, d_out_real));
+    const auto batch_gemm = [&]() {
+        Utils::sbgemm(Precision::DOUBLE, d_left_freq_major, d_right_freq_major,
+                      d_out_freq_major, block_dim, block_dim, block_dim, freq_len,
+                      cublas_handle, stream);
+    };
+    if (profile)
+        profile->sbgemm_ms = measure_gpu_ms(stream, batch_gemm);
+    else
+        batch_gemm();
+
+    const auto transpose_to_entry_major = [&]() {
+        Utils::transpose_2d(Precision::DOUBLE, d_out_freq_major, d_out_freq_entry,
+                            entries, freq_len, cublas_handle, stream);
+    };
+    if (profile)
+        profile->transpose_to_entry_major_ms =
+            measure_gpu_ms(stream, transpose_to_entry_major);
+    else
+        transpose_to_entry_major();
+
+    const auto inverse_fft = [&]() {
+        cufftSafeCall(cufftExecZ2D(inverse_plan, d_out_freq_entry, d_out_real));
+    };
+    if (profile)
+        profile->inverse_fft_ms = measure_gpu_ms(stream, inverse_fft);
+    else
+        inverse_fft();
+
     gpuErrchk(cudaStreamSynchronize(stream));
 
     std::vector<double> h_out_real(real_count);
-    gpuErrchk(cudaMemcpy(h_out_real.data(), d_out_real, real_count * sizeof(double),
-                         cudaMemcpyDeviceToHost));
+    const auto d2h_copy = [&]() {
+        gpuErrchk(cudaMemcpy(h_out_real.data(), d_out_real, real_count * sizeof(double),
+                             cudaMemcpyDeviceToHost));
+    };
+    if (profile)
+        profile->d2h_copy_ms = measure_cpu_ms(d2h_copy);
+    else
+        d2h_copy();
 
-    std::vector<double> out(static_cast<size_t>(out_len) * entries, 0.0);
-    const double scale = 1.0 / static_cast<double>(fft_len);
-    for (int t = 0; t < out_len; ++t)
-    {
-        for (int e = 0; e < entries; ++e)
+    std::vector<double> out;
+    const auto scale_truncate = [&]() {
+        out.assign(static_cast<size_t>(out_len) * entries, 0.0);
+        const double scale = 1.0 / static_cast<double>(fft_len);
+        for (int t = 0; t < out_len; ++t)
         {
-            out[block_entry(t, entries, e)] =
-                h_out_real[static_cast<size_t>(e) * fft_len + t] * scale;
+            for (int e = 0; e < entries; ++e)
+            {
+                out[block_entry(t, entries, e)] =
+                    h_out_real[static_cast<size_t>(e) * fft_len + t] * scale;
+            }
         }
-    }
+    };
+    if (profile)
+        profile->scale_truncate_ms = measure_cpu_ms(scale_truncate);
+    else
+        scale_truncate();
 
-    cublasSafeCall(cublasDestroy(cublas_handle));
-    cufftSafeCall(cufftDestroy(forward_plan));
-    cufftSafeCall(cufftDestroy(inverse_plan));
-    gpuErrchk(cudaFree(d_left_real));
-    gpuErrchk(cudaFree(d_right_real));
-    gpuErrchk(cudaFree(d_out_real));
-    gpuErrchk(cudaFree(d_left_freq_entry));
-    gpuErrchk(cudaFree(d_right_freq_entry));
-    gpuErrchk(cudaFree(d_out_freq_entry));
-    gpuErrchk(cudaFree(d_left_freq_major));
-    gpuErrchk(cudaFree(d_right_freq_major));
-    gpuErrchk(cudaFree(d_out_freq_major));
+    const auto cleanup = [&]() {
+        cublasSafeCall(cublasDestroy(cublas_handle));
+        cufftSafeCall(cufftDestroy(forward_plan));
+        cufftSafeCall(cufftDestroy(inverse_plan));
+        gpuErrchk(cudaFree(d_left_real));
+        gpuErrchk(cudaFree(d_right_real));
+        gpuErrchk(cudaFree(d_out_real));
+        gpuErrchk(cudaFree(d_left_freq_entry));
+        gpuErrchk(cudaFree(d_right_freq_entry));
+        gpuErrchk(cudaFree(d_out_freq_entry));
+        gpuErrchk(cudaFree(d_left_freq_major));
+        gpuErrchk(cudaFree(d_right_freq_major));
+        gpuErrchk(cudaFree(d_out_freq_major));
+    };
+    if (profile)
+        profile->cleanup_ms = measure_cpu_ms(cleanup);
+    else
+        cleanup();
+
+    if (profile)
+    {
+        const auto total_stop = std::chrono::steady_clock::now();
+        profile->total_ms =
+            std::chrono::duration<double, std::milli>(total_stop - total_start).count();
+    }
 
     return out;
 }
 
 std::vector<double> BlockToeplitzInverse::invert_newton_gpu(
     const std::vector<double> &blocks, int num_blocks, int block_dim,
-    cudaStream_t stream)
+    cudaStream_t stream, BlockToeplitzInverseProfile *profile)
 {
-    validate_blocks(blocks, num_blocks, block_dim);
+    const auto total_start = std::chrono::steady_clock::now();
+    if (profile)
+        *profile = BlockToeplitzInverseProfile{};
+
+    const auto validate = [&]() {
+        validate_blocks(blocks, num_blocks, block_dim);
+    };
+    if (profile)
+        profile->validate_ms = measure_cpu_ms(validate);
+    else
+        validate();
 
     const int entries = block_dim * block_dim;
-    const std::vector<double> A0_inv = invert_block_cpu(blocks.data(), block_dim);
+    std::vector<double> A0_inv;
+    const auto invert_a0 = [&]() {
+        A0_inv = invert_block_cpu(blocks.data(), block_dim);
+    };
+    if (profile)
+        profile->a0_inverse_ms = measure_cpu_ms(invert_a0);
+    else
+        invert_a0();
 
     std::vector<double> normalized(static_cast<size_t>(num_blocks) * entries, 0.0);
-    set_identity(normalized.data(), block_dim);
-    for (int k = 1; k < num_blocks; ++k)
-    {
-        block_gemm_cpu(A0_inv.data(), blocks.data() + block_entry(k, entries, 0),
-                       normalized.data() + block_entry(k, entries, 0), block_dim);
-    }
+    const auto normalize = [&]() {
+        set_identity(normalized.data(), block_dim);
+        for (int k = 1; k < num_blocks; ++k)
+        {
+            block_gemm_cpu(A0_inv.data(), blocks.data() + block_entry(k, entries, 0),
+                           normalized.data() + block_entry(k, entries, 0), block_dim);
+        }
+    };
+    if (profile)
+        profile->normalize_ms = measure_cpu_ms(normalize);
+    else
+        normalize();
 
     std::vector<double> H(entries, 0.0);
     set_identity(H.data(), block_dim);
@@ -329,26 +497,69 @@ std::vector<double> BlockToeplitzInverse::invert_newton_gpu(
         const int m_next = std::min(2 * m, num_blocks);
         const int fft_len = next_pow2(2 * m_next);
 
-        std::vector<double> A_prefix(normalized.begin(),
-                                     normalized.begin() + static_cast<size_t>(m_next) * entries);
+        std::vector<double> A_prefix;
+        const auto build_prefix = [&]() {
+            A_prefix.assign(normalized.begin(),
+                            normalized.begin() + static_cast<size_t>(m_next) * entries);
+        };
+        if (profile)
+            profile->a_prefix_ms += measure_cpu_ms(build_prefix);
+        else
+            build_prefix();
+
+        BlockToeplitzMultiplyProfile multiply_profile;
         std::vector<double> U = multiply_truncated_gpu(
-            A_prefix, m_next, H, m, m_next, block_dim, fft_len, stream);
+            A_prefix, m_next, H, m, m_next, block_dim, fft_len, stream,
+            profile ? &multiply_profile : nullptr);
+        if (profile)
+        {
+            accumulate_multiply_profile(profile->multiply, multiply_profile);
+            profile->multiply_calls++;
+        }
 
-        std::vector<double> V(U.size(), 0.0);
-        for (size_t i = 0; i < U.size(); ++i)
-            V[i] = -U[i];
-        for (int diag = 0; diag < block_dim; ++diag)
-            V[cm_entry(diag, diag, block_dim)] += 2.0;
+        std::vector<double> V;
+        const auto update_v = [&]() {
+            V.assign(U.size(), 0.0);
+            for (size_t i = 0; i < U.size(); ++i)
+                V[i] = -U[i];
+            for (int diag = 0; diag < block_dim; ++diag)
+                V[cm_entry(diag, diag, block_dim)] += 2.0;
+        };
+        if (profile)
+            profile->v_update_ms += measure_cpu_ms(update_v);
+        else
+            update_v();
 
-        H = multiply_truncated_gpu(H, m, V, m_next, m_next, block_dim, fft_len, stream);
+        H = multiply_truncated_gpu(
+            H, m, V, m_next, m_next, block_dim, fft_len, stream,
+            profile ? &multiply_profile : nullptr);
+        if (profile)
+        {
+            accumulate_multiply_profile(profile->multiply, multiply_profile);
+            profile->multiply_calls++;
+            profile->iterations++;
+        }
         m = m_next;
     }
 
     std::vector<double> inverse(static_cast<size_t>(num_blocks) * entries, 0.0);
-    for (int k = 0; k < num_blocks; ++k)
+    const auto undo_normalize = [&]() {
+        for (int k = 0; k < num_blocks; ++k)
+        {
+            block_gemm_cpu(H.data() + block_entry(k, entries, 0), A0_inv.data(),
+                           inverse.data() + block_entry(k, entries, 0), block_dim);
+        }
+    };
+    if (profile)
+        profile->undo_normalize_ms = measure_cpu_ms(undo_normalize);
+    else
+        undo_normalize();
+
+    if (profile)
     {
-        block_gemm_cpu(H.data() + block_entry(k, entries, 0), A0_inv.data(),
-                       inverse.data() + block_entry(k, entries, 0), block_dim);
+        const auto total_stop = std::chrono::steady_clock::now();
+        profile->total_ms =
+            std::chrono::duration<double, std::milli>(total_stop - total_start).count();
     }
 
     return inverse;

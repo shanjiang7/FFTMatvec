@@ -4,6 +4,38 @@
 #include <cuda_runtime.h>
 #include <vector>
 
+struct BlockToeplitzMultiplyProfile
+{
+    double total_ms = 0.0;
+    double host_pack_ms = 0.0;
+    double cuda_alloc_ms = 0.0;
+    double h2d_copy_ms = 0.0;
+    double cufft_plan_ms = 0.0;
+    double cublas_create_ms = 0.0;
+    double forward_fft_ms = 0.0;
+    double transpose_to_freq_major_ms = 0.0;
+    double sbgemm_ms = 0.0;
+    double transpose_to_entry_major_ms = 0.0;
+    double inverse_fft_ms = 0.0;
+    double d2h_copy_ms = 0.0;
+    double scale_truncate_ms = 0.0;
+    double cleanup_ms = 0.0;
+};
+
+struct BlockToeplitzInverseProfile
+{
+    double total_ms = 0.0;
+    double validate_ms = 0.0;
+    double a0_inverse_ms = 0.0;
+    double normalize_ms = 0.0;
+    double a_prefix_ms = 0.0;
+    double v_update_ms = 0.0;
+    double undo_normalize_ms = 0.0;
+    int iterations = 0;
+    int multiply_calls = 0;
+    BlockToeplitzMultiplyProfile multiply;
+};
+
 /**
  * @brief Utilities for inverting block lower-triangular Toeplitz matrices.
  *
@@ -28,7 +60,7 @@ public:
      */
     static std::vector<double> invert_newton_gpu(
         const std::vector<double> &blocks, int num_blocks, int block_dim,
-        cudaStream_t stream = 0);
+        cudaStream_t stream = 0, BlockToeplitzInverseProfile *profile = nullptr);
 
     /**
      * @brief Compute a truncated matrix-polynomial product on one GPU.
@@ -39,7 +71,8 @@ public:
     static std::vector<double> multiply_truncated_gpu(
         const std::vector<double> &left, int left_len,
         const std::vector<double> &right, int right_len,
-        int out_len, int block_dim, int fft_len, cudaStream_t stream = 0);
+        int out_len, int block_dim, int fft_len, cudaStream_t stream = 0,
+        BlockToeplitzMultiplyProfile *profile = nullptr);
 
     /**
      * @brief Frobenius norm of A * H - I modulo t^num_blocks.

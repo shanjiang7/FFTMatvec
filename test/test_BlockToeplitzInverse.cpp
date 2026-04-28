@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <gtest/gtest.h>
+#include <iostream>
 #include <vector>
 
 namespace
@@ -143,6 +145,55 @@ void expect_polynomial_multiply_matches_cpu(int left_len, int right_len, int out
 
     ASSERT_LT(max_abs_diff(expected, actual), tolerance);
 }
+
+void print_inverse_profile(const BlockToeplitzInverseProfile &profile)
+{
+    const double calls = std::max(1, profile.multiply_calls);
+    const BlockToeplitzMultiplyProfile &m = profile.multiply;
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "\n[BlockToeplitzInverseBenchmark]\n"
+              << "  total_ms: " << profile.total_ms << "\n"
+              << "  iterations: " << profile.iterations << "\n"
+              << "  multiply_calls: " << profile.multiply_calls << "\n"
+              << "  setup_ms:\n"
+              << "    validate: " << profile.validate_ms << "\n"
+              << "    a0_inverse: " << profile.a0_inverse_ms << "\n"
+              << "    normalize: " << profile.normalize_ms << "\n"
+              << "    a_prefix_total: " << profile.a_prefix_ms << "\n"
+              << "    v_update_total: " << profile.v_update_ms << "\n"
+              << "    undo_normalize: " << profile.undo_normalize_ms << "\n"
+              << "  multiply_total_ms:\n"
+              << "    total: " << m.total_ms << "\n"
+              << "    host_pack: " << m.host_pack_ms << "\n"
+              << "    cuda_alloc: " << m.cuda_alloc_ms << "\n"
+              << "    h2d_copy: " << m.h2d_copy_ms << "\n"
+              << "    cufft_plan: " << m.cufft_plan_ms << "\n"
+              << "    cublas_create: " << m.cublas_create_ms << "\n"
+              << "    forward_fft: " << m.forward_fft_ms << "\n"
+              << "    transpose_to_freq_major: " << m.transpose_to_freq_major_ms << "\n"
+              << "    sbgemm: " << m.sbgemm_ms << "\n"
+              << "    transpose_to_entry_major: " << m.transpose_to_entry_major_ms << "\n"
+              << "    inverse_fft: " << m.inverse_fft_ms << "\n"
+              << "    d2h_copy: " << m.d2h_copy_ms << "\n"
+              << "    scale_truncate: " << m.scale_truncate_ms << "\n"
+              << "    cleanup: " << m.cleanup_ms << "\n"
+              << "  multiply_avg_ms:\n"
+              << "    total: " << m.total_ms / calls << "\n"
+              << "    host_pack: " << m.host_pack_ms / calls << "\n"
+              << "    cuda_alloc: " << m.cuda_alloc_ms / calls << "\n"
+              << "    h2d_copy: " << m.h2d_copy_ms / calls << "\n"
+              << "    cufft_plan: " << m.cufft_plan_ms / calls << "\n"
+              << "    cublas_create: " << m.cublas_create_ms / calls << "\n"
+              << "    forward_fft: " << m.forward_fft_ms / calls << "\n"
+              << "    transpose_to_freq_major: " << m.transpose_to_freq_major_ms / calls << "\n"
+              << "    sbgemm: " << m.sbgemm_ms / calls << "\n"
+              << "    transpose_to_entry_major: " << m.transpose_to_entry_major_ms / calls << "\n"
+              << "    inverse_fft: " << m.inverse_fft_ms / calls << "\n"
+              << "    d2h_copy: " << m.d2h_copy_ms / calls << "\n"
+              << "    scale_truncate: " << m.scale_truncate_ms / calls << "\n"
+              << "    cleanup: " << m.cleanup_ms / calls << "\n";
+}
 } // namespace
 
 TEST(BlockToeplitzInverseTest, NextPow2)
@@ -226,4 +277,27 @@ TEST(BlockToeplitzInverseTest, ScalarToeplitzGpuNewton)
 
     ASSERT_LT(max_abs_diff(H_cpu, H_gpu), 1e-9);
     ASSERT_LT(BlockToeplitzInverse::residual_norm(A, H_gpu, num_blocks, block_dim), 1e-9);
+}
+
+TEST(BlockToeplitzInverseTest, BenchmarkProfile)
+{
+    if (!cuda_available())
+        GTEST_SKIP() << "CUDA device is not available.";
+
+    const int num_blocks = 128;
+    const int block_dim = 16;
+    const std::vector<double> A = make_problem(num_blocks, block_dim);
+
+    BlockToeplitzInverseProfile profile;
+    const std::vector<double> H =
+        BlockToeplitzInverse::invert_newton_gpu(A, num_blocks, block_dim, 0, &profile);
+
+    const double residual = BlockToeplitzInverse::residual_norm(A, H, num_blocks, block_dim);
+    print_inverse_profile(profile);
+    RecordProperty("total_ms", profile.total_ms);
+    RecordProperty("multiply_calls", profile.multiply_calls);
+    RecordProperty("multiply_total_ms", profile.multiply.total_ms);
+    RecordProperty("residual", residual);
+
+    ASSERT_LT(residual, 1e-7);
 }
