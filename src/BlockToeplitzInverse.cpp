@@ -176,10 +176,17 @@ void BlockToeplitzInverseWorkspace::cleanup()
 {
     for (PlanEntry &plan : plans)
     {
-        cufftSafeCall(cufftDestroy(plan.forward_plan));
-        cufftSafeCall(cufftDestroy(plan.inverse_plan));
+        if (plan.forward_plan)
+            cufftSafeCall(cufftDestroy(plan.forward_plan));
+        if (plan.inverse_plan)
+            cufftSafeCall(cufftDestroy(plan.inverse_plan));
     }
     plans.clear();
+
+    if (d_cufft_work)
+        gpuErrchk(cudaFree(d_cufft_work));
+    d_cufft_work = nullptr;
+    cufft_work_bytes = 0;
 
     if (cublas_handle)
     {
@@ -281,6 +288,34 @@ void BlockToeplitzInverseWorkspace::setup(const std::vector<int> &requested_fft_
     const size_t freq_count = static_cast<size_t>(entries) * max_freq_len;
     const size_t coeff_count = static_cast<size_t>(max_coeff_blocks) * entries;
 
+    for (const int fft_len : fft_lengths)
+    {
+        PlanEntry plan;
+        plan.fft_len = fft_len;
+        plan.freq_len = fft_len / 2 + 1;
+        int n[1] = {fft_len};
+        size_t forward_work_bytes = 0;
+        size_t inverse_work_bytes = 0;
+
+        cufftSafeCall(cufftCreate(&plan.forward_plan));
+        cufftSafeCall(cufftSetAutoAllocation(plan.forward_plan, 0));
+        cufftSafeCall(cufftMakePlanMany(plan.forward_plan, 1, n, nullptr, 1,
+                                        fft_len, nullptr, 1, plan.freq_len,
+                                        CUFFT_D2Z, entries, &forward_work_bytes));
+
+        cufftSafeCall(cufftCreate(&plan.inverse_plan));
+        cufftSafeCall(cufftSetAutoAllocation(plan.inverse_plan, 0));
+        cufftSafeCall(cufftMakePlanMany(plan.inverse_plan, 1, n, nullptr, 1,
+                                        plan.freq_len, nullptr, 1, fft_len,
+                                        CUFFT_Z2D, entries, &inverse_work_bytes));
+
+        cufft_work_bytes = std::max(cufft_work_bytes, forward_work_bytes);
+        cufft_work_bytes = std::max(cufft_work_bytes, inverse_work_bytes);
+        cufftSafeCall(cufftSetStream(plan.forward_plan, stream));
+        cufftSafeCall(cufftSetStream(plan.inverse_plan, stream));
+        plans.push_back(plan);
+    }
+
     gpuErrchk(cudaMalloc((void **)&d_left_real, real_count * sizeof(double)));
     gpuErrchk(cudaMalloc((void **)&d_right_real, real_count * sizeof(double)));
     gpuErrchk(cudaMalloc((void **)&d_out_real, real_count * sizeof(double)));
@@ -291,19 +326,14 @@ void BlockToeplitzInverseWorkspace::setup(const std::vector<int> &requested_fft_
     gpuErrchk(cudaMalloc((void **)&d_a_coeff, coeff_count * sizeof(double)));
     gpuErrchk(cudaMalloc((void **)&d_h_coeff, coeff_count * sizeof(double)));
 
-    for (const int fft_len : fft_lengths)
+    if (cufft_work_bytes > 0)
     {
-        PlanEntry plan;
-        plan.fft_len = fft_len;
-        plan.freq_len = fft_len / 2 + 1;
-        int n[1] = {fft_len};
-        cufftSafeCall(cufftPlanMany(&plan.forward_plan, 1, n, nullptr, 1, fft_len,
-                                    nullptr, 1, plan.freq_len, CUFFT_D2Z, entries));
-        cufftSafeCall(cufftPlanMany(&plan.inverse_plan, 1, n, nullptr, 1, plan.freq_len,
-                                    nullptr, 1, fft_len, CUFFT_Z2D, entries));
-        cufftSafeCall(cufftSetStream(plan.forward_plan, stream));
-        cufftSafeCall(cufftSetStream(plan.inverse_plan, stream));
-        plans.push_back(plan);
+        gpuErrchk(cudaMalloc(&d_cufft_work, cufft_work_bytes));
+        for (const PlanEntry &plan : plans)
+        {
+            cufftSafeCall(cufftSetWorkArea(plan.forward_plan, d_cufft_work));
+            cufftSafeCall(cufftSetWorkArea(plan.inverse_plan, d_cufft_work));
+        }
     }
 }
 

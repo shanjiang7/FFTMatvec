@@ -7,7 +7,7 @@ The benchmarked C++ test reads:
   BTI_BENCH_R
   BTI_BENCH_COEFF_SCALE
 
-and profiles only the preloaded Newton hot path via cudaProfilerStart/Stop.
+and profiles the preloaded Newton solve via cudaProfilerStart/Stop.
 """
 
 from __future__ import annotations
@@ -223,7 +223,7 @@ def plot_components(
             color=COMPONENT_COLORS[component],
             edgecolor="white",
             linewidth=0.45,
-            width=0.62,
+            width=0.48,
         )
         bottoms = [base + value for base, value in zip(bottoms, values)]
 
@@ -244,8 +244,8 @@ def plot_components(
     ax.set_xticks(x)
     ax.set_xticklabels([str(t) for t in t_values])
     ax.set_xlabel("Number of block coefficients T")
-    ax.set_ylabel("Hot path time (ms)")
-    ax.set_title(f"Block Toeplitz inverse hot path components (r = {block_dim})")
+    ax.set_ylabel("Time (ms)")
+    ax.set_title(f"Block Toeplitz inverse components (r = {block_dim})")
     ax.grid(axis="y", color="#D9D9D9", linewidth=0.7, alpha=0.75)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)

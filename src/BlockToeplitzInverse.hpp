@@ -11,8 +11,8 @@ private:
     {
         int fft_len = 0;
         int freq_len = 0;
-        cufftHandle forward_plan;
-        cufftHandle inverse_plan;
+        cufftHandle forward_plan = 0;
+        cufftHandle inverse_plan = 0;
     };
 
     int max_fft_len = 0;
@@ -23,6 +23,8 @@ private:
     cudaStream_t stream = 0;
     cublasHandle_t cublas_handle = nullptr;
     std::vector<PlanEntry> plans;
+    void *d_cufft_work = nullptr;
+    size_t cufft_work_bytes = 0;
 
     double *d_left_real = nullptr;
     double *d_right_real = nullptr;
