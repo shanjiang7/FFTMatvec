@@ -138,10 +138,6 @@ void BlockToeplitzInverseWorkspace::cleanup()
         gpuErrchk(cudaFree(d_right_real));
     if (d_out_real)
         gpuErrchk(cudaFree(d_out_real));
-    if (d_left_freq_entry)
-        gpuErrchk(cudaFree(d_left_freq_entry));
-    if (d_right_freq_entry)
-        gpuErrchk(cudaFree(d_right_freq_entry));
     if (d_out_freq_entry)
         gpuErrchk(cudaFree(d_out_freq_entry));
     if (d_left_freq_major)
@@ -158,8 +154,6 @@ void BlockToeplitzInverseWorkspace::cleanup()
     d_left_real = nullptr;
     d_right_real = nullptr;
     d_out_real = nullptr;
-    d_left_freq_entry = nullptr;
-    d_right_freq_entry = nullptr;
     d_out_freq_entry = nullptr;
     d_left_freq_major = nullptr;
     d_right_freq_major = nullptr;
@@ -178,17 +172,28 @@ void BlockToeplitzInverseWorkspace::cleanup()
 void BlockToeplitzInverseWorkspace::setup(int requested_max_fft_len, int requested_block_dim,
                                           cudaStream_t requested_stream)
 {
+    setup(requested_max_fft_len, std::max(1, requested_max_fft_len / 2),
+          requested_block_dim, requested_stream);
+}
+
+void BlockToeplitzInverseWorkspace::setup(int requested_max_fft_len,
+                                          int requested_max_coeff_blocks,
+                                          int requested_block_dim,
+                                          cudaStream_t requested_stream)
+{
     cleanup();
 
     if (requested_max_fft_len <= 0)
         throw std::invalid_argument("max_fft_len must be positive.");
     if (!is_power_of_two(requested_max_fft_len))
         throw std::invalid_argument("max_fft_len must be a power of two.");
+    if (requested_max_coeff_blocks <= 0)
+        throw std::invalid_argument("max_coeff_blocks must be positive.");
     if (requested_block_dim <= 0)
         throw std::invalid_argument("block_dim must be positive.");
 
     max_fft_len = requested_max_fft_len;
-    max_coeff_blocks = std::max(1, max_fft_len / 2);
+    max_coeff_blocks = requested_max_coeff_blocks;
     block_dim = requested_block_dim;
     entries = block_dim * block_dim;
     max_freq_len = max_fft_len / 2 + 1;
@@ -203,8 +208,6 @@ void BlockToeplitzInverseWorkspace::setup(int requested_max_fft_len, int request
     gpuErrchk(cudaMalloc((void **)&d_left_real, real_count * sizeof(double)));
     gpuErrchk(cudaMalloc((void **)&d_right_real, real_count * sizeof(double)));
     gpuErrchk(cudaMalloc((void **)&d_out_real, real_count * sizeof(double)));
-    gpuErrchk(cudaMalloc((void **)&d_left_freq_entry, freq_count * sizeof(ComplexD)));
-    gpuErrchk(cudaMalloc((void **)&d_right_freq_entry, freq_count * sizeof(ComplexD)));
     gpuErrchk(cudaMalloc((void **)&d_out_freq_entry, freq_count * sizeof(ComplexD)));
     gpuErrchk(cudaMalloc((void **)&d_left_freq_major, freq_count * sizeof(ComplexD)));
     gpuErrchk(cudaMalloc((void **)&d_right_freq_major, freq_count * sizeof(ComplexD)));
@@ -297,8 +300,6 @@ void BlockToeplitzInverse::newton_step_gpu(
     double *d_a_real = workspace.d_left_real;
     double *d_h_real = workspace.d_right_real;
     double *d_work_real = workspace.d_out_real;
-    ComplexD *d_a_freq_entry = workspace.d_left_freq_entry;
-    ComplexD *d_h_freq_entry = workspace.d_right_freq_entry;
     ComplexD *d_work_freq_entry = workspace.d_out_freq_entry;
     ComplexD *d_a_freq_major = workspace.d_left_freq_major;
     ComplexD *d_h_freq_major = workspace.d_right_freq_major;
@@ -310,12 +311,11 @@ void BlockToeplitzInverse::newton_step_gpu(
     UtilKernels::pack_blocks_to_entry_real(
         workspace.d_h_coeff, d_h_real, m, fft_len, entries, stream);
 
-    cufftSafeCall(cufftExecD2Z(plans.forward_plan, d_a_real, d_a_freq_entry));
-    cufftSafeCall(cufftExecD2Z(plans.forward_plan, d_h_real, d_h_freq_entry));
-
-    Utils::transpose_2d(Precision::DOUBLE, d_a_freq_entry, d_a_freq_major,
+    cufftSafeCall(cufftExecD2Z(plans.forward_plan, d_a_real, d_work_freq_entry));
+    Utils::transpose_2d(Precision::DOUBLE, d_work_freq_entry, d_a_freq_major,
                         freq_len, entries, cublas_handle, stream);
-    Utils::transpose_2d(Precision::DOUBLE, d_h_freq_entry, d_h_freq_major,
+    cufftSafeCall(cufftExecD2Z(plans.forward_plan, d_h_real, d_work_freq_entry));
+    Utils::transpose_2d(Precision::DOUBLE, d_work_freq_entry, d_h_freq_major,
                         freq_len, entries, cublas_handle, stream);
 
     Utils::sbgemm(Precision::DOUBLE, d_a_freq_major, d_h_freq_major,
@@ -363,7 +363,7 @@ std::vector<double> BlockToeplitzInverse::invert_newton_gpu(
     }
 
     BlockToeplitzInverseWorkspace workspace;
-    workspace.setup(next_pow2(2 * num_blocks), block_dim, stream);
+    workspace.setup(next_pow2(2 * num_blocks), num_blocks, block_dim, stream);
     return invert_newton_gpu(blocks, num_blocks, block_dim, workspace);
 }
 

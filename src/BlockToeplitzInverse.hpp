@@ -27,8 +27,6 @@ private:
     double *d_left_real = nullptr;
     double *d_right_real = nullptr;
     double *d_out_real = nullptr;
-    ComplexD *d_left_freq_entry = nullptr;
-    ComplexD *d_right_freq_entry = nullptr;
     ComplexD *d_out_freq_entry = nullptr;
     ComplexD *d_left_freq_major = nullptr;
     ComplexD *d_right_freq_major = nullptr;
@@ -46,6 +44,8 @@ public:
     BlockToeplitzInverseWorkspace &operator=(const BlockToeplitzInverseWorkspace &) = delete;
 
     void setup(int max_fft_len, int block_dim, cudaStream_t stream = 0);
+    void setup(int max_fft_len, int max_coeff_blocks, int block_dim,
+               cudaStream_t stream = 0);
     void cleanup();
 
     friend class BlockToeplitzInverse;

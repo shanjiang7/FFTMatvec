@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <gtest/gtest.h>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #if defined(__has_include)
@@ -116,6 +118,38 @@ void profiler_stop()
 #endif
 }
 
+int env_int(const char *name, int fallback)
+{
+    const char *value = std::getenv(name);
+    if (!value)
+        return fallback;
+    try
+    {
+        return std::stoi(value);
+    }
+    catch (const std::exception &)
+    {
+        throw std::invalid_argument(std::string("Invalid integer environment variable ") +
+                                    name + "=" + value);
+    }
+}
+
+double env_double(const char *name, double fallback)
+{
+    const char *value = std::getenv(name);
+    if (!value)
+        return fallback;
+    try
+    {
+        return std::stod(value);
+    }
+    catch (const std::exception &)
+    {
+        throw std::invalid_argument(std::string("Invalid floating-point environment variable ") +
+                                    name + "=" + value);
+    }
+}
+
 } // namespace
 
 TEST(BlockToeplitzInverseTest, NextPow2)
@@ -212,10 +246,11 @@ TEST(BlockToeplitzInverseTest, BenchmarkNsysLarge)
     if (!cuda_available())
         GTEST_SKIP() << "CUDA device is not available.";
 
-    const int num_blocks = 4096;
-    const int block_dim = 256;
+    const int num_blocks = env_int("BTI_BENCH_T", 4096);
+    const int block_dim = env_int("BTI_BENCH_R", 256);
+    const double coeff_scale = env_double("BTI_BENCH_COEFF_SCALE", 0.001);
     const std::vector<double> A =
-        make_normalized_problem(num_blocks, block_dim, 0.001);
+        make_normalized_problem(num_blocks, block_dim, coeff_scale);
 
     const std::vector<double> H =
         BlockToeplitzInverse::invert_newton_gpu(A, num_blocks, block_dim);
@@ -230,13 +265,15 @@ TEST(BlockToeplitzInverseTest, BenchmarkNsysWarmLarge)
     if (!cuda_available())
         GTEST_SKIP() << "CUDA device is not available.";
 
-    const int num_blocks = 4096;
-    const int block_dim = 256;
+    const int num_blocks = env_int("BTI_BENCH_T", 4096);
+    const int block_dim = env_int("BTI_BENCH_R", 256);
+    const double coeff_scale = env_double("BTI_BENCH_COEFF_SCALE", 0.001);
     const std::vector<double> A =
-        make_normalized_problem(num_blocks, block_dim, 0.001);
+        make_normalized_problem(num_blocks, block_dim, coeff_scale);
 
     BlockToeplitzInverseWorkspace workspace;
-    workspace.setup(BlockToeplitzInverse::next_pow2(2 * num_blocks), block_dim);
+    workspace.setup(BlockToeplitzInverse::next_pow2(2 * num_blocks), num_blocks,
+                    block_dim);
 
     BlockToeplitzInverse::load_coefficients_gpu(A, num_blocks, block_dim, workspace);
     BlockToeplitzInverse::invert_preloaded_newton_gpu(num_blocks, block_dim, workspace);
