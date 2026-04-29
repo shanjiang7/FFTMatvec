@@ -4,6 +4,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -133,6 +137,27 @@ int good_fft_len_impl(int n)
     return candidate;
 }
 
+int partition_size(int global_size, int rank, int parts)
+{
+    if (global_size <= 0)
+        throw std::invalid_argument("global_size must be positive.");
+    if (parts <= 0)
+        throw std::invalid_argument("parts must be positive.");
+    if (rank < 0 || rank >= parts)
+        throw std::invalid_argument("rank is outside the process grid.");
+    const int base = global_size / parts;
+    const int remainder = global_size % parts;
+    return base + (rank < remainder ? 1 : 0);
+}
+
+int partition_start(int global_size, int rank, int parts)
+{
+    (void)partition_size(global_size, rank, parts);
+    const int base = global_size / parts;
+    const int remainder = global_size % parts;
+    return rank * base + std::min(rank, remainder);
+}
+
 std::vector<int> power_two_fft_lengths(int max_fft_len)
 {
     std::vector<int> fft_lengths;
@@ -165,7 +190,127 @@ std::vector<int> newton_fft_lengths(int num_blocks)
     return fft_lengths;
 }
 
+bool print_workspace_report_enabled()
+{
+    const char *value = std::getenv("BTI_PRINT_WORKSPACE");
+    return value != nullptr && std::string(value) != "0";
+}
+
+long double bytes_to_gib(long double bytes)
+{
+    return bytes / (1024.0L * 1024.0L * 1024.0L);
+}
+
+std::string bytes_string(long double bytes)
+{
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(3) << bytes_to_gib(bytes) << " GiB";
+    return os.str();
+}
+
+std::string join_ints(const std::vector<int> &values)
+{
+    std::ostringstream os;
+    for (size_t i = 0; i < values.size(); ++i)
+    {
+        if (i > 0)
+            os << ", ";
+        os << values[i];
+    }
+    return os.str();
+}
+
+void append_buffer_report(std::ostringstream &os, const std::string &name,
+                          size_t count, size_t element_size, int copies,
+                          long double &tracked_total)
+{
+    const long double bytes =
+        static_cast<long double>(count) * element_size * copies;
+    tracked_total += bytes;
+    os << "    " << std::left << std::setw(24) << name
+       << " count=" << count
+       << ", elem=" << element_size
+       << ", copies=" << copies
+       << ", total=" << bytes_string(bytes) << "\n";
+}
+
+std::string build_workspace_memory_report(
+    int max_coeff_blocks, int block_dim, int entries, int max_fft_len,
+    int max_freq_len, size_t cufft_work_bytes,
+    const std::vector<int> &fft_lengths)
+{
+    const size_t real_count = static_cast<size_t>(entries) * max_fft_len;
+    const size_t freq_count = static_cast<size_t>(entries) * max_freq_len;
+    const size_t coeff_count = static_cast<size_t>(max_coeff_blocks) * entries;
+
+    std::ostringstream os;
+    os << "\n[BlockToeplitzInverseWorkspaceMemory]\n";
+    os << "  max_coeff_blocks: " << max_coeff_blocks << "\n";
+    os << "  block_dim:        " << block_dim << "\n";
+    os << "  entries:          " << entries << "\n";
+    os << "  max_fft_len:      " << max_fft_len << "\n";
+    os << "  max_freq_len:     " << max_freq_len << "\n";
+    os << "  fft_lengths:      " << join_ints(fft_lengths) << "\n";
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    const cudaError_t mem_status = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (mem_status == cudaSuccess)
+    {
+        os << "  cuda_free_now:    " << bytes_string(free_bytes) << "\n";
+        os << "  cuda_total:       " << bytes_string(total_bytes) << "\n";
+    }
+
+    long double tracked_total = 0.0L;
+    os << "  buffers:\n";
+    append_buffer_report(os, "real work buffers", real_count, sizeof(double),
+                         3, tracked_total);
+    append_buffer_report(os, "freq entry buffer", freq_count, sizeof(ComplexD),
+                         1, tracked_total);
+    append_buffer_report(os, "freq major buffers", freq_count, sizeof(ComplexD),
+                         3, tracked_total);
+    append_buffer_report(os, "coefficient buffers", coeff_count, sizeof(double),
+                         2, tracked_total);
+    append_buffer_report(os, "shared cufft work", 1, cufft_work_bytes,
+                         cufft_work_bytes > 0 ? 1 : 0, tracked_total);
+    os << "  tracked_total:    " << bytes_string(tracked_total) << "\n";
+    os << std::flush;
+    return os.str();
+}
+
 } // namespace
+
+BlockToeplitzInverseDistributedLayout
+BlockToeplitzInverseDistributedLayout::create(
+    int requested_global_block_dim, int requested_proc_rows,
+    int requested_proc_cols, int requested_row_rank, int requested_col_rank)
+{
+    BlockToeplitzInverseDistributedLayout layout;
+    layout.global_block_dim = requested_global_block_dim;
+    layout.proc_rows = requested_proc_rows;
+    layout.proc_cols = requested_proc_cols;
+    layout.row_rank = requested_row_rank;
+    layout.col_rank = requested_col_rank;
+    layout.local_row_start = partition_start(
+        requested_global_block_dim, requested_row_rank, requested_proc_rows);
+    layout.local_rows = partition_size(
+        requested_global_block_dim, requested_row_rank, requested_proc_rows);
+    layout.local_col_start = partition_start(
+        requested_global_block_dim, requested_col_rank, requested_proc_cols);
+    layout.local_cols = partition_size(
+        requested_global_block_dim, requested_col_rank, requested_proc_cols);
+    return layout;
+}
+
+size_t BlockToeplitzInverseDistributedLayout::local_entries() const
+{
+    return static_cast<size_t>(local_rows) * local_cols;
+}
+
+size_t BlockToeplitzInverseDistributedLayout::global_entries() const
+{
+    return static_cast<size_t>(global_block_dim) * global_block_dim;
+}
 
 BlockToeplitzInverseWorkspace::~BlockToeplitzInverseWorkspace()
 {
@@ -316,6 +461,13 @@ void BlockToeplitzInverseWorkspace::setup(const std::vector<int> &requested_fft_
         plans.push_back(plan);
     }
 
+    if (print_workspace_report_enabled())
+    {
+        std::cerr << build_workspace_memory_report(
+            max_coeff_blocks, block_dim, entries, max_fft_len, max_freq_len,
+            cufft_work_bytes, fft_lengths);
+    }
+
     gpuErrchk(cudaMalloc((void **)&d_left_real, real_count * sizeof(double)));
     gpuErrchk(cudaMalloc((void **)&d_right_real, real_count * sizeof(double)));
     gpuErrchk(cudaMalloc((void **)&d_out_real, real_count * sizeof(double)));
@@ -342,6 +494,17 @@ void BlockToeplitzInverseWorkspace::setup_for_problem(int num_blocks, int reques
 {
     setup(newton_fft_lengths(num_blocks), num_blocks, requested_block_dim,
           requested_stream);
+}
+
+std::string BlockToeplitzInverseWorkspace::memory_report() const
+{
+    std::vector<int> fft_lengths;
+    fft_lengths.reserve(plans.size());
+    for (const PlanEntry &plan : plans)
+        fft_lengths.push_back(plan.fft_len);
+    return build_workspace_memory_report(
+        max_coeff_blocks, block_dim, entries, max_fft_len, max_freq_len,
+        cufft_work_bytes, fft_lengths);
 }
 
 const BlockToeplitzInverseWorkspace::PlanEntry &

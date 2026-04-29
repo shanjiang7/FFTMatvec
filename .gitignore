@@ -14,4 +14,10 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Nsight reports
+*.sqlite
+*.nsys-rep
+*.qdstrm
+*.ncu-rep
+
 test/data/test_vec.h5

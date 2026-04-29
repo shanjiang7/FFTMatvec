@@ -169,6 +169,53 @@ TEST(BlockToeplitzInverseTest, GoodFftLen)
     ASSERT_LT(BlockToeplitzInverse::good_fft_len(6145), 8192);
 }
 
+TEST(BlockToeplitzInverseTest, DistributedLayoutPartitionsBlockEntries)
+{
+    const int block_dim = 512;
+    size_t covered_entries = 0;
+
+    for (int row_rank = 0; row_rank < 2; ++row_rank)
+    {
+        for (int col_rank = 0; col_rank < 2; ++col_rank)
+        {
+            const BlockToeplitzInverseDistributedLayout layout =
+                BlockToeplitzInverseDistributedLayout::create(
+                    block_dim, 2, 2, row_rank, col_rank);
+            EXPECT_EQ(layout.local_rows, 256);
+            EXPECT_EQ(layout.local_cols, 256);
+            EXPECT_EQ(layout.local_entries(), static_cast<size_t>(256) * 256);
+            covered_entries += layout.local_entries();
+        }
+    }
+
+    EXPECT_EQ(covered_entries, static_cast<size_t>(block_dim) * block_dim);
+}
+
+TEST(BlockToeplitzInverseTest, DistributedLayoutHandlesUnevenBlockDim)
+{
+    const int block_dim = 400;
+    size_t covered_entries = 0;
+
+    for (int row_rank = 0; row_rank < 3; ++row_rank)
+    {
+        for (int col_rank = 0; col_rank < 2; ++col_rank)
+        {
+            const BlockToeplitzInverseDistributedLayout layout =
+                BlockToeplitzInverseDistributedLayout::create(
+                    block_dim, 3, 2, row_rank, col_rank);
+            EXPECT_GE(layout.local_rows, 133);
+            EXPECT_LE(layout.local_rows, 134);
+            EXPECT_EQ(layout.local_cols, 200);
+            covered_entries += layout.local_entries();
+        }
+    }
+
+    EXPECT_EQ(covered_entries, static_cast<size_t>(block_dim) * block_dim);
+    EXPECT_THROW(BlockToeplitzInverseDistributedLayout::create(
+                     block_dim, 3, 2, 3, 0),
+                 std::invalid_argument);
+}
+
 TEST(BlockToeplitzInverseTest, CpuReferenceResidual)
 {
     const int num_blocks = 8;

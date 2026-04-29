@@ -4,6 +4,26 @@
 #include "shared.hpp"
 #include <vector>
 
+struct BlockToeplitzInverseDistributedLayout
+{
+    int global_block_dim = 0;
+    int proc_rows = 1;
+    int proc_cols = 1;
+    int row_rank = 0;
+    int col_rank = 0;
+    int local_row_start = 0;
+    int local_rows = 0;
+    int local_col_start = 0;
+    int local_cols = 0;
+
+    static BlockToeplitzInverseDistributedLayout create(
+        int global_block_dim, int proc_rows, int proc_cols,
+        int row_rank, int col_rank);
+
+    size_t local_entries() const;
+    size_t global_entries() const;
+};
+
 class BlockToeplitzInverseWorkspace
 {
 private:
@@ -52,6 +72,11 @@ public:
                int block_dim, cudaStream_t stream = 0);
     void setup_for_problem(int num_blocks, int block_dim, cudaStream_t stream = 0);
     void cleanup();
+
+    /**
+     * @brief Human-readable estimate of this workspace's resident GPU buffers.
+     */
+    std::string memory_report() const;
 
     friend class BlockToeplitzInverse;
 };
