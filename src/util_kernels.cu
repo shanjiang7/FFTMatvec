@@ -559,3 +559,93 @@ void UtilKernels::elementwise_multiply_add(const double *d_x, const double *d_y,
   elementwise_multiply_add_kernel<<<blocks, threads_per_block, 0, s>>>(
       d_x, d_y, d_z, d_out, size);
 }
+
+__global__ void pack_blocks_to_entry_real_kernel(const double *d_blocks,
+                                                 double *d_entry_real,
+                                                 int block_len, int fft_len,
+                                                 int entries, size_t total) {
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += (size_t)blockDim.x * gridDim.x) {
+    const int t = static_cast<int>(idx % fft_len);
+    const int e = static_cast<int>(idx / fft_len);
+    d_entry_real[idx] =
+        (t < block_len) ? d_blocks[(size_t)t * entries + e] : 0.0;
+  }
+}
+
+__global__ void build_newton_v_real_kernel(const double *d_u_ifft,
+                                           double *d_v_real, int out_len,
+                                           int fft_len, int block_dim,
+                                           int entries, size_t total) {
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += (size_t)blockDim.x * gridDim.x) {
+    const int t = static_cast<int>(idx % fft_len);
+    const int e = static_cast<int>(idx / fft_len);
+
+    double value = 0.0;
+    if (t < out_len) {
+      value = -d_u_ifft[idx] / static_cast<double>(fft_len);
+      const int row = e % block_dim;
+      const int col = e / block_dim;
+      if (t == 0 && row == col)
+        value += 2.0;
+    }
+    d_v_real[idx] = value;
+  }
+}
+
+__global__ void unpack_entry_real_to_blocks_kernel(const double *d_entry_real,
+                                                   double *d_blocks,
+                                                   int out_len, int fft_len,
+                                                   int entries,
+                                                   size_t total) {
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += (size_t)blockDim.x * gridDim.x) {
+    const int e = static_cast<int>(idx % entries);
+    const int t = static_cast<int>(idx / entries);
+    d_blocks[idx] =
+        d_entry_real[(size_t)e * fft_len + t] / static_cast<double>(fft_len);
+  }
+}
+
+static unsigned int inverse_kernel_blocks(size_t total) {
+  const size_t blocks = (total + 255) / 256;
+  return static_cast<unsigned int>(std::min<size_t>(blocks, 16384));
+}
+
+void UtilKernels::pack_blocks_to_entry_real(const double *d_blocks,
+                                            double *d_entry_real,
+                                            int block_len, int fft_len,
+                                            int entries, cudaStream_t s) {
+  const size_t total = static_cast<size_t>(entries) * fft_len;
+  if (total == 0)
+    return;
+  pack_blocks_to_entry_real_kernel<<<inverse_kernel_blocks(total), 256, 0, s>>>(
+      d_blocks, d_entry_real, block_len, fft_len, entries, total);
+  gpuErrchk(cudaPeekAtLastError());
+}
+
+void UtilKernels::build_newton_v_real(const double *d_u_ifft, double *d_v_real,
+                                      int out_len, int fft_len, int block_dim,
+                                      cudaStream_t s) {
+  const int entries = block_dim * block_dim;
+  const size_t total = static_cast<size_t>(entries) * fft_len;
+  if (total == 0)
+    return;
+  build_newton_v_real_kernel<<<inverse_kernel_blocks(total), 256, 0, s>>>(
+      d_u_ifft, d_v_real, out_len, fft_len, block_dim, entries, total);
+  gpuErrchk(cudaPeekAtLastError());
+}
+
+void UtilKernels::unpack_entry_real_to_blocks(const double *d_entry_real,
+                                              double *d_blocks, int out_len,
+                                              int fft_len, int entries,
+                                              cudaStream_t s) {
+  const size_t total = static_cast<size_t>(out_len) * entries;
+  if (total == 0)
+    return;
+  unpack_entry_real_to_blocks_kernel<<<inverse_kernel_blocks(total), 256, 0,
+                                       s>>>(d_entry_real, d_blocks, out_len,
+                                            fft_len, entries, total);
+  gpuErrchk(cudaPeekAtLastError());
+}

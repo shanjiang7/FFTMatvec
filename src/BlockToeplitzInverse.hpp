@@ -1,39 +1,54 @@
 #ifndef __BLOCK_TOEPLITZ_INVERSE_HPP__
 #define __BLOCK_TOEPLITZ_INVERSE_HPP__
 
-#include <cuda_runtime.h>
+#include "shared.hpp"
 #include <vector>
 
-struct BlockToeplitzMultiplyProfile
+class BlockToeplitzInverseWorkspace
 {
-    double total_ms = 0.0;
-    double host_pack_ms = 0.0;
-    double cuda_alloc_ms = 0.0;
-    double h2d_copy_ms = 0.0;
-    double cufft_plan_ms = 0.0;
-    double cublas_create_ms = 0.0;
-    double forward_fft_ms = 0.0;
-    double transpose_to_freq_major_ms = 0.0;
-    double sbgemm_ms = 0.0;
-    double transpose_to_entry_major_ms = 0.0;
-    double inverse_fft_ms = 0.0;
-    double d2h_copy_ms = 0.0;
-    double scale_truncate_ms = 0.0;
-    double cleanup_ms = 0.0;
-};
+private:
+    struct PlanEntry
+    {
+        int fft_len = 0;
+        int freq_len = 0;
+        cufftHandle forward_plan;
+        cufftHandle inverse_plan;
+    };
 
-struct BlockToeplitzInverseProfile
-{
-    double total_ms = 0.0;
-    double validate_ms = 0.0;
-    double a0_inverse_ms = 0.0;
-    double normalize_ms = 0.0;
-    double a_prefix_ms = 0.0;
-    double v_update_ms = 0.0;
-    double undo_normalize_ms = 0.0;
-    int iterations = 0;
-    int multiply_calls = 0;
-    BlockToeplitzMultiplyProfile multiply;
+    int max_fft_len = 0;
+    int max_coeff_blocks = 0;
+    int block_dim = 0;
+    int entries = 0;
+    int max_freq_len = 0;
+    cudaStream_t stream = 0;
+    cublasHandle_t cublas_handle = nullptr;
+    std::vector<PlanEntry> plans;
+
+    double *d_left_real = nullptr;
+    double *d_right_real = nullptr;
+    double *d_out_real = nullptr;
+    ComplexD *d_left_freq_entry = nullptr;
+    ComplexD *d_right_freq_entry = nullptr;
+    ComplexD *d_out_freq_entry = nullptr;
+    ComplexD *d_left_freq_major = nullptr;
+    ComplexD *d_right_freq_major = nullptr;
+    ComplexD *d_out_freq_major = nullptr;
+    double *d_a_coeff = nullptr;
+    double *d_h_coeff = nullptr;
+
+    const PlanEntry &get_plan(int fft_len) const;
+
+public:
+    BlockToeplitzInverseWorkspace() = default;
+    ~BlockToeplitzInverseWorkspace();
+
+    BlockToeplitzInverseWorkspace(const BlockToeplitzInverseWorkspace &) = delete;
+    BlockToeplitzInverseWorkspace &operator=(const BlockToeplitzInverseWorkspace &) = delete;
+
+    void setup(int max_fft_len, int block_dim, cudaStream_t stream = 0);
+    void cleanup();
+
+    friend class BlockToeplitzInverse;
 };
 
 /**
@@ -57,22 +72,12 @@ public:
 
     /**
      * @brief Compute the first column of A^{-1} using GPU FFT Newton doubling.
+     *
+     * This path assumes the input has already been normalized so A_0 = I.
      */
     static std::vector<double> invert_newton_gpu(
         const std::vector<double> &blocks, int num_blocks, int block_dim,
-        cudaStream_t stream = 0, BlockToeplitzInverseProfile *profile = nullptr);
-
-    /**
-     * @brief Compute a truncated matrix-polynomial product on one GPU.
-     *
-     * Returns left(t) * right(t) modulo t^out_len. Inputs use the same
-     * coefficient-major, column-major block layout as invert_newton_gpu.
-     */
-    static std::vector<double> multiply_truncated_gpu(
-        const std::vector<double> &left, int left_len,
-        const std::vector<double> &right, int right_len,
-        int out_len, int block_dim, int fft_len, cudaStream_t stream = 0,
-        BlockToeplitzMultiplyProfile *profile = nullptr);
+        cudaStream_t stream = 0);
 
     /**
      * @brief Frobenius norm of A * H - I modulo t^num_blocks.
@@ -88,6 +93,9 @@ public:
 
 private:
     static std::vector<double> invert_block_cpu(const double *block, int block_dim);
+    static void newton_step_gpu(
+        int m, int m_next, int block_dim, int fft_len,
+        BlockToeplitzInverseWorkspace &workspace);
 };
 
 #endif // __BLOCK_TOEPLITZ_INVERSE_HPP__

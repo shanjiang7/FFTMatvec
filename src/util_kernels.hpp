@@ -188,6 +188,30 @@ void elementwise_multiply_add(const double *d_x, const double *d_y,
                               const double *d_z, double *d_out, size_t size,
                               cudaStream_t s);
 
+/**
+ * @brief Pack coefficient-major block storage into entry-major real FFT layout.
+ *
+ * d_blocks is blocks[t * entries + e]. d_entry_real is d_entry_real[e * fft_len + t],
+ * zero-padded for t >= block_len.
+ */
+void pack_blocks_to_entry_real(const double *d_blocks, double *d_entry_real,
+                               int block_len, int fft_len, int entries,
+                               cudaStream_t s);
+
+/**
+ * @brief Build V = 2I - U in entry-major real FFT layout after an unnormalized IFFT.
+ */
+void build_newton_v_real(const double *d_u_ifft, double *d_v_real,
+                         int out_len, int fft_len, int block_dim,
+                         cudaStream_t s);
+
+/**
+ * @brief Scale unnormalized IFFT output and store it as coefficient-major blocks.
+ */
+void unpack_entry_real_to_blocks(const double *d_entry_real, double *d_blocks,
+                                 int out_len, int fft_len, int entries,
+                                 cudaStream_t s);
+
 } // namespace UtilKernels
 
 #endif // __UTIL_KERNELS_H__
