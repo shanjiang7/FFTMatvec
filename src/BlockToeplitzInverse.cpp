@@ -1,4 +1,5 @@
 #include "BlockToeplitzInverse.hpp"
+#include "Comm.hpp"
 #include "util_kernels.hpp"
 #include "utils.hpp"
 
@@ -158,6 +159,11 @@ int partition_start(int global_size, int rank, int parts)
     return rank * base + std::min(rank, remainder);
 }
 
+int max_partition_size(int global_size, int parts)
+{
+    return partition_size(global_size, 0, parts);
+}
+
 std::vector<int> power_two_fft_lengths(int max_fft_len)
 {
     std::vector<int> fft_lengths;
@@ -289,6 +295,14 @@ std::string build_distributed_layout_memory_report(
     const size_t real_count = entries * max_fft_len;
     const size_t freq_count = entries * max_freq_len;
     const size_t coeff_count = static_cast<size_t>(num_blocks) * entries;
+    const int max_inner_rows =
+        max_partition_size(layout.global_block_dim, layout.proc_rows);
+    const int max_inner_cols =
+        max_partition_size(layout.global_block_dim, layout.proc_cols);
+    const size_t a_panel_count =
+        static_cast<size_t>(max_freq_len) * layout.local_rows * max_inner_cols;
+    const size_t b_panel_count =
+        static_cast<size_t>(max_freq_len) * max_inner_rows * layout.local_cols;
 
     std::ostringstream os;
     os << "\n[BlockToeplitzInverseDistributedLayoutMemory]\n";
@@ -311,13 +325,17 @@ std::string build_distributed_layout_memory_report(
     os << "  fft_lengths:      " << join_ints(fft_lengths) << "\n";
 
     long double tracked_total = 0.0L;
-    os << "  local buffers before distributed GEMM communication:\n";
+    os << "  local buffers:\n";
     append_buffer_report(os, "real work buffers", real_count, sizeof(double),
                          3, tracked_total);
     append_buffer_report(os, "freq entry buffer", freq_count, sizeof(ComplexD),
                          1, tracked_total);
     append_buffer_report(os, "freq gemm buffers", freq_count, sizeof(ComplexD),
                          3, tracked_total);
+    append_buffer_report(os, "SUMMA A panel buffer", a_panel_count,
+                         sizeof(ComplexD), 1, tracked_total);
+    append_buffer_report(os, "SUMMA B panel buffer", b_panel_count,
+                         sizeof(ComplexD), 1, tracked_total);
     append_buffer_report(os, "coefficient buffers", coeff_count, sizeof(double),
                          2, tracked_total);
     if (cufft_work_bytes > 0)
@@ -331,8 +349,49 @@ std::string build_distributed_layout_memory_report(
         os << "  tracked_total_no_cufft_work: " << bytes_string(tracked_total)
            << "\n";
     }
-    os << "  note: SUMMA panel buffers are not included.\n";
+    os << "  note: full distributed Newton still needs communication scheduling.\n";
     return os.str();
+}
+
+void validate_distributed_gemm_grid(
+    const BlockToeplitzInverseDistributedLayout &layout, Comm &comm)
+{
+    if (layout.proc_rows != layout.proc_cols)
+        throw std::invalid_argument(
+            "Distributed GEMM currently requires a square process grid.");
+    if (layout.proc_rows != comm.get_proc_rows() ||
+        layout.proc_cols != comm.get_proc_cols())
+        throw std::invalid_argument(
+            "Distributed layout process grid does not match Comm.");
+    if (layout.row_rank != comm.get_row_color() ||
+        layout.col_rank != comm.get_col_color())
+        throw std::invalid_argument(
+            "Distributed layout rank tile does not match Comm rank.");
+}
+
+void sbgemm_accumulate_double(
+    const ComplexD *d_a, const ComplexD *d_b, ComplexD *d_c,
+    int m, int n, int k, int batch_count, bool accumulate,
+    cublasHandle_t handle, cudaStream_t stream)
+{
+    const cuDoubleComplex alpha = make_cuDoubleComplex(1.0, 0.0);
+    const cuDoubleComplex beta =
+        make_cuDoubleComplex(accumulate ? 1.0 : 0.0, 0.0);
+
+    cublasSafeCall(cublasSetStream(handle, stream));
+    cublasSafeCall(cublasZgemmStridedBatched(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        m, n, k,
+        &alpha,
+        reinterpret_cast<const cuDoubleComplex *>(d_a), m,
+        static_cast<long long int>(m) * k,
+        reinterpret_cast<const cuDoubleComplex *>(d_b), k,
+        static_cast<long long int>(k) * n,
+        &beta,
+        reinterpret_cast<cuDoubleComplex *>(d_c), m,
+        static_cast<long long int>(m) * n,
+        batch_count));
 }
 
 } // namespace
@@ -604,6 +663,10 @@ void BlockToeplitzInverseDistributedWorkspace::cleanup()
         gpuErrchk(cudaFree(d_right_gemm_freq));
     if (d_out_gemm_freq)
         gpuErrchk(cudaFree(d_out_gemm_freq));
+    if (d_a_panel_freq)
+        gpuErrchk(cudaFree(d_a_panel_freq));
+    if (d_b_panel_freq)
+        gpuErrchk(cudaFree(d_b_panel_freq));
     if (d_a_coeff)
         gpuErrchk(cudaFree(d_a_coeff));
     if (d_h_coeff)
@@ -617,6 +680,8 @@ void BlockToeplitzInverseDistributedWorkspace::cleanup()
     d_left_gemm_freq = nullptr;
     d_right_gemm_freq = nullptr;
     d_out_gemm_freq = nullptr;
+    d_a_panel_freq = nullptr;
+    d_b_panel_freq = nullptr;
     d_a_coeff = nullptr;
     d_h_coeff = nullptr;
 
@@ -688,6 +753,14 @@ void BlockToeplitzInverseDistributedWorkspace::setup_for_problem(
         static_cast<size_t>(local_entries_count) * max_freq_len;
     const size_t coeff_count =
         static_cast<size_t>(num_blocks) * local_entries_count;
+    const int max_inner_rows =
+        max_partition_size(layout.global_block_dim, layout.proc_rows);
+    const int max_inner_cols =
+        max_partition_size(layout.global_block_dim, layout.proc_cols);
+    const size_t a_panel_count =
+        static_cast<size_t>(max_freq_len) * layout.local_rows * max_inner_cols;
+    const size_t b_panel_count =
+        static_cast<size_t>(max_freq_len) * max_inner_rows * layout.local_cols;
 
     gpuErrchk(cudaMalloc((void **)&d_left_real, real_count * sizeof(double)));
     gpuErrchk(cudaMalloc((void **)&d_right_real, real_count * sizeof(double)));
@@ -699,6 +772,10 @@ void BlockToeplitzInverseDistributedWorkspace::setup_for_problem(
                          freq_count * sizeof(ComplexD)));
     gpuErrchk(cudaMalloc((void **)&d_out_gemm_freq,
                          freq_count * sizeof(ComplexD)));
+    gpuErrchk(cudaMalloc((void **)&d_a_panel_freq,
+                         a_panel_count * sizeof(ComplexD)));
+    gpuErrchk(cudaMalloc((void **)&d_b_panel_freq,
+                         b_panel_count * sizeof(ComplexD)));
     gpuErrchk(cudaMalloc((void **)&d_a_coeff, coeff_count * sizeof(double)));
     gpuErrchk(cudaMalloc((void **)&d_h_coeff, coeff_count * sizeof(double)));
 
@@ -717,6 +794,58 @@ std::string BlockToeplitzInverseDistributedWorkspace::memory_report() const
 {
     return build_distributed_layout_memory_report(
         num_blocks, layout, cufft_work_bytes);
+}
+
+void BlockToeplitzInverseDistributedWorkspace::sbgemm_freq_major(
+    const ComplexD *d_a_local, const ComplexD *d_b_local,
+    ComplexD *d_c_local, int freq_len, Comm &comm)
+{
+    if (!d_a_local || !d_b_local || !d_c_local)
+        throw std::invalid_argument("Distributed GEMM received a null pointer.");
+    if (!d_a_panel_freq || !d_b_panel_freq)
+        throw std::invalid_argument("Distributed workspace has not been set up.");
+    if (freq_len <= 0 || freq_len > max_freq_len)
+        throw std::invalid_argument("freq_len is outside workspace capacity.");
+
+    validate_distributed_gemm_grid(layout, comm);
+
+    const int p = layout.proc_rows;
+    const int m = layout.local_rows;
+    const int n = layout.local_cols;
+    cudaStream_t stream = comm.get_stream();
+
+    for (int k_rank = 0; k_rank < p; ++k_rank)
+    {
+        const int inner = partition_size(
+            layout.global_block_dim, k_rank, p);
+        const size_t a_panel_complex_count =
+            static_cast<size_t>(freq_len) * m * inner;
+        const size_t b_panel_complex_count =
+            static_cast<size_t>(freq_len) * inner * n;
+
+        const ComplexD *a_send =
+            (layout.col_rank == k_rank) ? d_a_local : d_a_panel_freq;
+        const ComplexD *b_send =
+            (layout.row_rank == k_rank) ? d_b_local : d_b_panel_freq;
+
+        NCCLCHECK(ncclGroupStart());
+        NCCLCHECK(ncclBroadcast(
+            reinterpret_cast<const double *>(a_send),
+            reinterpret_cast<double *>(d_a_panel_freq),
+            2 * a_panel_complex_count, ncclDouble, k_rank,
+            comm.get_gpu_row_comm(), stream));
+        NCCLCHECK(ncclBroadcast(
+            reinterpret_cast<const double *>(b_send),
+            reinterpret_cast<double *>(d_b_panel_freq),
+            2 * b_panel_complex_count, ncclDouble, k_rank,
+            comm.get_gpu_col_comm(), stream));
+        NCCLCHECK(ncclGroupEnd());
+
+        sbgemm_accumulate_double(
+            d_a_panel_freq, d_b_panel_freq, d_c_local,
+            m, n, inner, freq_len, k_rank != 0,
+            comm.get_cublasHandle(), stream);
+    }
 }
 
 const BlockToeplitzInverseWorkspace::PlanEntry &

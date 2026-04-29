@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+class Comm;
+
 struct BlockToeplitzInverseDistributedLayout
 {
     int global_block_dim = 0;
@@ -122,6 +124,8 @@ private:
     ComplexD *d_left_gemm_freq = nullptr;
     ComplexD *d_right_gemm_freq = nullptr;
     ComplexD *d_out_gemm_freq = nullptr;
+    ComplexD *d_a_panel_freq = nullptr;
+    ComplexD *d_b_panel_freq = nullptr;
     double *d_a_coeff = nullptr;
     double *d_h_coeff = nullptr;
 
@@ -139,6 +143,17 @@ public:
                            cudaStream_t stream = 0);
     void cleanup();
     std::string memory_report() const;
+
+    /**
+     * @brief Distributed strided-batched GEMM on frequency-major local tiles.
+     *
+     * Computes C_ij(f) = sum_k A_ik(f) B_kj(f) for every local frequency f.
+     * The process grid must be square for this first SUMMA implementation.
+     */
+    void sbgemm_freq_major(const ComplexD *d_a_local,
+                           const ComplexD *d_b_local,
+                           ComplexD *d_c_local,
+                           int freq_len, Comm &comm);
 };
 
 /**

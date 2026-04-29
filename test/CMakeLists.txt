@@ -67,6 +67,7 @@ set(TEST_SOURCE_FILES_ORIGINAL
     test_Matrix.cpp
     test_Matvec.cpp
     test_BlockToeplitzInverse.cpp
+    test_BlockToeplitzInverseDistributed.cpp
 )
 
 set(TEST_FILES_TO_HIPIFY "") # Will store absolute paths
@@ -153,6 +154,9 @@ add_gtest(MatvecTest "${MATVEC_TEST_SRC}" "${TEST_ALL_LIBS}" ${NUM_PROCS})
 
 get_conditional_test_source(BLOCK_TOEPLITZ_INVERSE_TEST_SRC test_BlockToeplitzInverse.cpp)
 add_gtest(BlockToeplitzInverseTest "${BLOCK_TOEPLITZ_INVERSE_TEST_SRC}" "${TEST_ALL_LIBS}" 1)
+
+get_conditional_test_source(BLOCK_TOEPLITZ_INVERSE_DISTRIBUTED_TEST_SRC test_BlockToeplitzInverseDistributed.cpp)
+add_gtest(BlockToeplitzInverseDistributedTest "${BLOCK_TOEPLITZ_INVERSE_DISTRIBUTED_TEST_SRC}" "${TEST_ALL_LIBS}" ${NUM_PROCS})
 
 # If you have a global HipifyAll target and want test hipification to be part of it:
 if(BUILD_WITH_HIP AND TARGET HipifyAll)
