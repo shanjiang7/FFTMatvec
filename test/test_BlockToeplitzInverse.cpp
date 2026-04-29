@@ -160,6 +160,15 @@ TEST(BlockToeplitzInverseTest, NextPow2)
     ASSERT_EQ(BlockToeplitzInverse::next_pow2(17), 32);
 }
 
+TEST(BlockToeplitzInverseTest, GoodFftLen)
+{
+    ASSERT_EQ(BlockToeplitzInverse::good_fft_len(1), 1);
+    ASSERT_EQ(BlockToeplitzInverse::good_fft_len(6144), 6144);
+    ASSERT_EQ(BlockToeplitzInverse::good_fft_len(10240), 10240);
+    ASSERT_GE(BlockToeplitzInverse::good_fft_len(6145), 6145);
+    ASSERT_LT(BlockToeplitzInverse::good_fft_len(6145), 8192);
+}
+
 TEST(BlockToeplitzInverseTest, CpuReferenceResidual)
 {
     const int num_blocks = 8;
@@ -272,8 +281,7 @@ TEST(BlockToeplitzInverseTest, BenchmarkNsysWarmLarge)
         make_normalized_problem(num_blocks, block_dim, coeff_scale);
 
     BlockToeplitzInverseWorkspace workspace;
-    workspace.setup(BlockToeplitzInverse::next_pow2(2 * num_blocks), num_blocks,
-                    block_dim);
+    workspace.setup_for_problem(num_blocks, block_dim);
 
     BlockToeplitzInverse::load_coefficients_gpu(A, num_blocks, block_dim, workspace);
     BlockToeplitzInverse::invert_preloaded_newton_gpu(num_blocks, block_dim, workspace);

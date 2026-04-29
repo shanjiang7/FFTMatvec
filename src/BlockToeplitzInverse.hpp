@@ -46,6 +46,9 @@ public:
     void setup(int max_fft_len, int block_dim, cudaStream_t stream = 0);
     void setup(int max_fft_len, int max_coeff_blocks, int block_dim,
                cudaStream_t stream = 0);
+    void setup(const std::vector<int> &fft_lengths, int max_coeff_blocks,
+               int block_dim, cudaStream_t stream = 0);
+    void setup_for_problem(int num_blocks, int block_dim, cudaStream_t stream = 0);
     void cleanup();
 
     friend class BlockToeplitzInverse;
@@ -85,9 +88,10 @@ public:
     /**
      * @brief Compute A^{-1} using a caller-owned workspace.
      *
-     * The workspace must have been set up with max_fft_len >= next_pow2(2*num_blocks)
-     * and the same block_dim. This path is intended for warm benchmarks and repeated
-     * solves where cuBLAS handles, cuFFT plans, and GPU buffers should be reused.
+     * The workspace should be set up with setup_for_problem(num_blocks, block_dim)
+     * or otherwise contain the FFT plans needed by the Newton steps. This path is
+     * intended for warm benchmarks and repeated solves where cuBLAS handles, cuFFT
+     * plans, and GPU buffers should be reused.
      */
     static std::vector<double> invert_newton_gpu(
         const std::vector<double> &blocks, int num_blocks, int block_dim,
@@ -126,6 +130,11 @@ public:
      * @brief Small helper exposed for tests and iteration planning.
      */
     static int next_pow2(int n);
+
+    /**
+     * @brief Small cuFFT-friendly length >= n using only 2, 3, 5, and 7 factors.
+     */
+    static int good_fft_len(int n);
 
 private:
     static void newton_step_gpu(

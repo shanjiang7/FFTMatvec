@@ -110,6 +110,61 @@ bool is_power_of_two(int n)
     return n > 0 && (n & (n - 1)) == 0;
 }
 
+bool has_good_fft_factors(int n)
+{
+    if (n <= 0)
+        return false;
+    const int primes[] = {2, 3, 5, 7};
+    for (const int prime : primes)
+    {
+        while (n % prime == 0)
+            n /= prime;
+    }
+    return n == 1;
+}
+
+int good_fft_len_impl(int n)
+{
+    if (n <= 1)
+        return 1;
+    int candidate = n;
+    while (!has_good_fft_factors(candidate))
+        ++candidate;
+    return candidate;
+}
+
+std::vector<int> power_two_fft_lengths(int max_fft_len)
+{
+    std::vector<int> fft_lengths;
+    for (int fft_len = 4; fft_len <= max_fft_len; fft_len <<= 1)
+        fft_lengths.push_back(fft_len);
+    if (fft_lengths.empty())
+        fft_lengths.push_back(4);
+    return fft_lengths;
+}
+
+std::vector<int> newton_fft_lengths(int num_blocks)
+{
+    if (num_blocks <= 0)
+        throw std::invalid_argument("num_blocks must be positive.");
+
+    std::vector<int> fft_lengths;
+    int m = 1;
+    while (m < num_blocks)
+    {
+        const int m_next = std::min(2 * m, num_blocks);
+        fft_lengths.push_back(good_fft_len_impl(2 * m_next));
+        m = m_next;
+    }
+    if (fft_lengths.empty())
+        fft_lengths.push_back(4);
+
+    std::sort(fft_lengths.begin(), fft_lengths.end());
+    fft_lengths.erase(std::unique(fft_lengths.begin(), fft_lengths.end()),
+                      fft_lengths.end());
+    return fft_lengths;
+}
+
 } // namespace
 
 BlockToeplitzInverseWorkspace::~BlockToeplitzInverseWorkspace()
@@ -181,18 +236,39 @@ void BlockToeplitzInverseWorkspace::setup(int requested_max_fft_len,
                                           int requested_block_dim,
                                           cudaStream_t requested_stream)
 {
-    cleanup();
-
     if (requested_max_fft_len <= 0)
         throw std::invalid_argument("max_fft_len must be positive.");
     if (!is_power_of_two(requested_max_fft_len))
         throw std::invalid_argument("max_fft_len must be a power of two.");
+    setup(power_two_fft_lengths(requested_max_fft_len), requested_max_coeff_blocks,
+          requested_block_dim, requested_stream);
+}
+
+void BlockToeplitzInverseWorkspace::setup(const std::vector<int> &requested_fft_lengths,
+                                          int requested_max_coeff_blocks,
+                                          int requested_block_dim,
+                                          cudaStream_t requested_stream)
+{
+    cleanup();
+
+    if (requested_fft_lengths.empty())
+        throw std::invalid_argument("At least one FFT length is required.");
     if (requested_max_coeff_blocks <= 0)
         throw std::invalid_argument("max_coeff_blocks must be positive.");
     if (requested_block_dim <= 0)
         throw std::invalid_argument("block_dim must be positive.");
 
-    max_fft_len = requested_max_fft_len;
+    std::vector<int> fft_lengths = requested_fft_lengths;
+    std::sort(fft_lengths.begin(), fft_lengths.end());
+    fft_lengths.erase(std::unique(fft_lengths.begin(), fft_lengths.end()),
+                      fft_lengths.end());
+    for (const int fft_len : fft_lengths)
+    {
+        if (fft_len <= 0)
+            throw std::invalid_argument("FFT lengths must be positive.");
+    }
+
+    max_fft_len = fft_lengths.back();
     max_coeff_blocks = requested_max_coeff_blocks;
     block_dim = requested_block_dim;
     entries = block_dim * block_dim;
@@ -215,7 +291,7 @@ void BlockToeplitzInverseWorkspace::setup(int requested_max_fft_len,
     gpuErrchk(cudaMalloc((void **)&d_a_coeff, coeff_count * sizeof(double)));
     gpuErrchk(cudaMalloc((void **)&d_h_coeff, coeff_count * sizeof(double)));
 
-    for (int fft_len = 4; fft_len <= max_fft_len; fft_len <<= 1)
+    for (const int fft_len : fft_lengths)
     {
         PlanEntry plan;
         plan.fft_len = fft_len;
@@ -229,6 +305,13 @@ void BlockToeplitzInverseWorkspace::setup(int requested_max_fft_len,
         cufftSafeCall(cufftSetStream(plan.inverse_plan, stream));
         plans.push_back(plan);
     }
+}
+
+void BlockToeplitzInverseWorkspace::setup_for_problem(int num_blocks, int requested_block_dim,
+                                                      cudaStream_t requested_stream)
+{
+    setup(newton_fft_lengths(num_blocks), num_blocks, requested_block_dim,
+          requested_stream);
 }
 
 const BlockToeplitzInverseWorkspace::PlanEntry &
@@ -250,6 +333,11 @@ int BlockToeplitzInverse::next_pow2(int n)
     while (result < n)
         result <<= 1;
     return result;
+}
+
+int BlockToeplitzInverse::good_fft_len(int n)
+{
+    return good_fft_len_impl(n);
 }
 
 std::vector<double> BlockToeplitzInverse::invert_cpu_reference(
@@ -363,7 +451,7 @@ std::vector<double> BlockToeplitzInverse::invert_newton_gpu(
     }
 
     BlockToeplitzInverseWorkspace workspace;
-    workspace.setup(next_pow2(2 * num_blocks), num_blocks, block_dim, stream);
+    workspace.setup_for_problem(num_blocks, block_dim, stream);
     return invert_newton_gpu(blocks, num_blocks, block_dim, workspace);
 }
 
@@ -389,9 +477,11 @@ void BlockToeplitzInverse::load_coefficients_gpu(
     if (workspace.max_coeff_blocks < num_blocks)
         throw std::invalid_argument("Workspace max coefficient capacity is too small.");
 
-    const int max_fft_len = next_pow2(2 * num_blocks);
+    const int max_fft_len = good_fft_len(2 * num_blocks);
     if (workspace.max_fft_len < max_fft_len)
         throw std::invalid_argument("Workspace max_fft_len is too small.");
+    for (const int fft_len : newton_fft_lengths(num_blocks))
+        (void)workspace.get_plan(fft_len);
     if (!workspace.cublas_handle || !workspace.d_a_coeff || !workspace.d_h_coeff)
         throw std::invalid_argument("Workspace has not been set up.");
 
@@ -415,9 +505,11 @@ void BlockToeplitzInverse::invert_preloaded_newton_gpu(
     if (workspace.max_coeff_blocks < num_blocks)
         throw std::invalid_argument("Workspace max coefficient capacity is too small.");
 
-    const int max_fft_len = next_pow2(2 * num_blocks);
+    const int max_fft_len = good_fft_len(2 * num_blocks);
     if (workspace.max_fft_len < max_fft_len)
         throw std::invalid_argument("Workspace max_fft_len is too small.");
+    for (const int fft_len : newton_fft_lengths(num_blocks))
+        (void)workspace.get_plan(fft_len);
     if (!workspace.cublas_handle || !workspace.d_a_coeff || !workspace.d_h_coeff)
         throw std::invalid_argument("Workspace has not been set up.");
 
@@ -427,7 +519,7 @@ void BlockToeplitzInverse::invert_preloaded_newton_gpu(
     while (m < num_blocks)
     {
         const int m_next = std::min(2 * m, num_blocks);
-        const int fft_len = next_pow2(2 * m_next);
+        const int fft_len = good_fft_len(2 * m_next);
         const NvtxRange range("newton_" + std::to_string(m) + "_to_" +
                               std::to_string(m_next) + "_fft_" +
                               std::to_string(fft_len));

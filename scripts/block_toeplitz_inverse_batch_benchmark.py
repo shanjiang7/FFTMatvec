@@ -31,13 +31,13 @@ COMPONENT_ORDER = [
 ]
 
 COMPONENT_COLORS = {
-    "Pack": "#4E79A7",
-    "FFT": "#F1CE63",
+    "Pack": "#4C78A8",
+    "FFT": "#F2CF5B",
     "Transpose": "#D37295",
-    "GEMM": "#9D5DBA",
+    "GEMM": "#8E63B0",
     "Build V": "#59A14F",
     "Unpack": "#C49A3A",
-    "Other": "#BAB0AC",
+    "Other": "#B8B8B8",
 }
 
 
@@ -191,11 +191,26 @@ def plot_components(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.size": 11,
+            "axes.labelsize": 12,
+            "axes.titlesize": 13,
+            "legend.fontsize": 10,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "axes.edgecolor": "#444444",
+            "axes.linewidth": 0.8,
+        }
+    )
+
     t_values = sorted(summaries)
     x = list(range(len(t_values)))
     bottoms = [0.0] * len(t_values)
+    totals = [sum(summaries[t].values()) for t in t_values]
 
-    fig, ax = plt.subplots(figsize=(8.5, 4.8))
+    fig, ax = plt.subplots(figsize=(8.0, 4.6), constrained_layout=True)
     for component in COMPONENT_ORDER:
         values = [summaries[t].get(component, 0.0) for t in t_values]
         if component == "Other" and max(values, default=0.0) < 1e-6:
@@ -207,20 +222,48 @@ def plot_components(
             label=component,
             color=COMPONENT_COLORS[component],
             edgecolor="white",
-            linewidth=0.5,
+            linewidth=0.45,
+            width=0.62,
         )
         bottoms = [base + value for base, value in zip(bottoms, values)]
 
+    y_max = max(totals) if totals else 0.0
+    ax.set_ylim(0.0, y_max * 1.14 if y_max > 0.0 else 1.0)
+    for x_pos, total in zip(x, totals):
+        label = f"{total:.0f}" if total >= 100.0 else f"{total:.1f}"
+        ax.text(
+            x_pos,
+            total + 0.025 * y_max,
+            label,
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            color="#333333",
+        )
+
     ax.set_xticks(x)
     ax.set_xticklabels([str(t) for t in t_values])
-    ax.set_xlabel("T")
+    ax.set_xlabel("Number of block coefficients T")
     ax.set_ylabel("Hot path time (ms)")
-    ax.set_title(f"Block Toeplitz Inverse Hot Path Components (r={block_dim})")
-    ax.grid(axis="y", alpha=0.25)
-    ax.legend(frameon=True, loc="upper left", bbox_to_anchor=(1.02, 1.0))
-    fig.tight_layout()
+    ax.set_title(f"Block Toeplitz inverse hot path components (r = {block_dim})")
+    ax.grid(axis="y", color="#D9D9D9", linewidth=0.7, alpha=0.75)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    legend = ax.legend(
+        title="Component",
+        frameon=True,
+        fancybox=False,
+        edgecolor="#CCCCCC",
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0,
+    )
+    legend.get_frame().set_linewidth(0.8)
+    legend.get_frame().set_facecolor("#FAFAFA")
     fig.savefig(png_path, dpi=220)
     fig.savefig(png_path.with_suffix(".pdf"))
+    fig.savefig(png_path.with_suffix(".svg"))
 
 
 def main() -> None:
@@ -275,6 +318,7 @@ def main() -> None:
     print(f"\nWrote {csv_path}")
     print(f"Wrote {png_path}")
     print(f"Wrote {png_path.with_suffix('.pdf')}")
+    print(f"Wrote {png_path.with_suffix('.svg')}")
 
 
 if __name__ == "__main__":
