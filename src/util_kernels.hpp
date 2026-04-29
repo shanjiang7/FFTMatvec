@@ -212,6 +212,11 @@ void unpack_entry_real_to_blocks(const double *d_entry_real, double *d_blocks,
                                  int out_len, int fft_len, int entries,
                                  cudaStream_t s);
 
+/**
+ * @brief Initialize one column-major block to identity on the GPU.
+ */
+void set_identity_block(double *d_block, int block_dim, cudaStream_t s);
+
 } // namespace UtilKernels
 
 #endif // __UTIL_KERNELS_H__

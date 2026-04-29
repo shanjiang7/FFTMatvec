@@ -91,6 +91,28 @@ public:
         BlockToeplitzInverseWorkspace &workspace);
 
     /**
+     * @brief Copy normalized A coefficients into a caller-owned GPU workspace.
+     */
+    static void load_coefficients_gpu(
+        const std::vector<double> &blocks, int num_blocks, int block_dim,
+        BlockToeplitzInverseWorkspace &workspace);
+
+    /**
+     * @brief Run Newton doubling using A already loaded in the workspace.
+     *
+     * The result remains resident in the workspace. Use copy_inverse_from_workspace
+     * when a host vector is needed.
+     */
+    static void invert_preloaded_newton_gpu(
+        int num_blocks, int block_dim, BlockToeplitzInverseWorkspace &workspace);
+
+    /**
+     * @brief Copy the device-resident inverse from the workspace to a host vector.
+     */
+    static std::vector<double> copy_inverse_from_workspace(
+        int num_blocks, int block_dim, BlockToeplitzInverseWorkspace &workspace);
+
+    /**
      * @brief Frobenius norm of A * H - I modulo t^num_blocks.
      */
     static double residual_norm(

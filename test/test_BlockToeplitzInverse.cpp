@@ -236,18 +236,17 @@ TEST(BlockToeplitzInverseTest, BenchmarkNsysWarmLarge)
     BlockToeplitzInverseWorkspace workspace;
     workspace.setup(BlockToeplitzInverse::next_pow2(2 * num_blocks), block_dim);
 
-    {
-        const std::vector<double> warmup =
-            BlockToeplitzInverse::invert_newton_gpu(A, num_blocks, block_dim, workspace);
-        ASSERT_EQ(warmup.size(), static_cast<size_t>(num_blocks) * block_dim * block_dim);
-    }
+    BlockToeplitzInverse::load_coefficients_gpu(A, num_blocks, block_dim, workspace);
+    BlockToeplitzInverse::invert_preloaded_newton_gpu(num_blocks, block_dim, workspace);
     gpuErrchk(cudaDeviceSynchronize());
 
     profiler_start();
-    const std::vector<double> H =
-        BlockToeplitzInverse::invert_newton_gpu(A, num_blocks, block_dim, workspace);
+    BlockToeplitzInverse::invert_preloaded_newton_gpu(num_blocks, block_dim, workspace);
     gpuErrchk(cudaDeviceSynchronize());
     profiler_stop();
+
+    const std::vector<double> H =
+        BlockToeplitzInverse::copy_inverse_from_workspace(num_blocks, block_dim, workspace);
 
     ASSERT_EQ(H.size(), static_cast<size_t>(num_blocks) * block_dim * block_dim);
     ASSERT_NEAR(H[0], 1.0, 1e-10);

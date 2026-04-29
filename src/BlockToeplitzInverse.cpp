@@ -412,19 +412,19 @@ std::vector<double> BlockToeplitzInverse::invert_newton_gpu(
     const std::vector<double> &blocks, int num_blocks, int block_dim,
     BlockToeplitzInverseWorkspace &workspace)
 {
+    load_coefficients_gpu(blocks, num_blocks, block_dim, workspace);
+    invert_preloaded_newton_gpu(num_blocks, block_dim, workspace);
+    return copy_inverse_from_workspace(num_blocks, block_dim, workspace);
+}
+
+void BlockToeplitzInverse::load_coefficients_gpu(
+    const std::vector<double> &blocks, int num_blocks, int block_dim,
+    BlockToeplitzInverseWorkspace &workspace)
+{
     validate_blocks(blocks, num_blocks, block_dim);
     if (!is_identity_block(blocks.data(), block_dim, 1e-12))
         throw std::invalid_argument(
             "invert_newton_gpu expects normalized input with A_0 = I.");
-
-    const int entries = block_dim * block_dim;
-
-    std::vector<double> H(static_cast<size_t>(num_blocks) * entries, 0.0);
-    set_identity(H.data(), block_dim);
-
-    if (num_blocks == 1)
-        return H;
-
     if (workspace.block_dim != block_dim)
         throw std::invalid_argument("Workspace block_dim does not match requested block_dim.");
     if (workspace.max_coeff_blocks < num_blocks)
@@ -436,17 +436,33 @@ std::vector<double> BlockToeplitzInverse::invert_newton_gpu(
     if (!workspace.cublas_handle || !workspace.d_a_coeff || !workspace.d_h_coeff)
         throw std::invalid_argument("Workspace has not been set up.");
 
+    const int entries = block_dim * block_dim;
     cudaStream_t stream = workspace.stream;
-    const size_t coeff_count = static_cast<size_t>(workspace.max_coeff_blocks) * entries;
     gpuErrchk(cudaMemcpyAsync(workspace.d_a_coeff, blocks.data(),
                               static_cast<size_t>(num_blocks) * entries *
                                   sizeof(double),
                               cudaMemcpyHostToDevice, stream));
-    gpuErrchk(cudaMemsetAsync(workspace.d_h_coeff, 0,
-                              coeff_count * sizeof(double), stream));
-    gpuErrchk(cudaMemcpyAsync(workspace.d_h_coeff, H.data(),
-                              static_cast<size_t>(entries) * sizeof(double),
-                              cudaMemcpyHostToDevice, stream));
+}
+
+void BlockToeplitzInverse::invert_preloaded_newton_gpu(
+    int num_blocks, int block_dim, BlockToeplitzInverseWorkspace &workspace)
+{
+    if (num_blocks <= 0)
+        throw std::invalid_argument("num_blocks must be positive.");
+    if (block_dim <= 0)
+        throw std::invalid_argument("block_dim must be positive.");
+    if (workspace.block_dim != block_dim)
+        throw std::invalid_argument("Workspace block_dim does not match requested block_dim.");
+    if (workspace.max_coeff_blocks < num_blocks)
+        throw std::invalid_argument("Workspace max coefficient capacity is too small.");
+
+    const int max_fft_len = next_pow2(2 * num_blocks);
+    if (workspace.max_fft_len < max_fft_len)
+        throw std::invalid_argument("Workspace max_fft_len is too small.");
+    if (!workspace.cublas_handle || !workspace.d_a_coeff || !workspace.d_h_coeff)
+        throw std::invalid_argument("Workspace has not been set up.");
+
+    UtilKernels::set_identity_block(workspace.d_h_coeff, block_dim, workspace.stream);
 
     int m = 1;
     while (m < num_blocks)
@@ -456,8 +472,26 @@ std::vector<double> BlockToeplitzInverse::invert_newton_gpu(
         newton_step_gpu(m, m_next, block_dim, fft_len, workspace);
         m = m_next;
     }
+}
 
-    gpuErrchk(cudaStreamSynchronize(stream));
+std::vector<double> BlockToeplitzInverse::copy_inverse_from_workspace(
+    int num_blocks, int block_dim, BlockToeplitzInverseWorkspace &workspace)
+{
+    if (num_blocks <= 0)
+        throw std::invalid_argument("num_blocks must be positive.");
+    if (block_dim <= 0)
+        throw std::invalid_argument("block_dim must be positive.");
+    if (workspace.block_dim != block_dim)
+        throw std::invalid_argument("Workspace block_dim does not match requested block_dim.");
+    if (workspace.max_coeff_blocks < num_blocks)
+        throw std::invalid_argument("Workspace max coefficient capacity is too small.");
+    if (!workspace.d_h_coeff)
+        throw std::invalid_argument("Workspace has not been set up.");
+
+    const int entries = block_dim * block_dim;
+    std::vector<double> H(static_cast<size_t>(num_blocks) * entries, 0.0);
+
+    gpuErrchk(cudaStreamSynchronize(workspace.stream));
     gpuErrchk(cudaMemcpy(H.data(), workspace.d_h_coeff,
                          static_cast<size_t>(num_blocks) * entries *
                              sizeof(double),

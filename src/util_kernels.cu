@@ -608,6 +608,16 @@ __global__ void unpack_entry_real_to_blocks_kernel(const double *d_entry_real,
   }
 }
 
+__global__ void set_identity_block_kernel(double *d_block, int block_dim,
+                                          int entries) {
+  for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < entries;
+       e += blockDim.x * gridDim.x) {
+    const int row = e % block_dim;
+    const int col = e / block_dim;
+    d_block[e] = (row == col) ? 1.0 : 0.0;
+  }
+}
+
 static unsigned int inverse_kernel_blocks(size_t total) {
   const size_t blocks = (total + 255) / 256;
   return static_cast<unsigned int>(std::min<size_t>(blocks, 16384));
@@ -647,5 +657,15 @@ void UtilKernels::unpack_entry_real_to_blocks(const double *d_entry_real,
   unpack_entry_real_to_blocks_kernel<<<inverse_kernel_blocks(total), 256, 0,
                                        s>>>(d_entry_real, d_blocks, out_len,
                                             fft_len, entries, total);
+  gpuErrchk(cudaPeekAtLastError());
+}
+
+void UtilKernels::set_identity_block(double *d_block, int block_dim,
+                                     cudaStream_t s) {
+  const int entries = block_dim * block_dim;
+  if (entries == 0)
+    return;
+  set_identity_block_kernel<<<inverse_kernel_blocks(entries), 256, 0, s>>>(
+      d_block, block_dim, entries);
   gpuErrchk(cudaPeekAtLastError());
 }
