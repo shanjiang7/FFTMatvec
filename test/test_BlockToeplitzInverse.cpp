@@ -1,5 +1,6 @@
 #include "BlockToeplitzInverse.hpp"
 #include "util_kernels.hpp"
+#include "utils.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -257,7 +258,7 @@ TEST(BlockToeplitzInverseTest, DistributedLayoutReportsLocalMemory)
     EXPECT_NE(report.find("tracked_total_no_cufft_work"), std::string::npos);
 }
 
-TEST(BlockToeplitzInverseTest, DistributedReindexRoundTrip)
+TEST(BlockToeplitzInverseTest, DistributedTransposeRoundTrip)
 {
     if (!cuda_available())
         GTEST_SKIP() << "CUDA device is not available.";
@@ -285,10 +286,12 @@ TEST(BlockToeplitzInverseTest, DistributedReindexRoundTrip)
     gpuErrchk(cudaMemcpy(d_entry_freq, entry_freq.data(), count * sizeof(ComplexD),
                          cudaMemcpyHostToDevice));
 
-    UtilKernels::entry_freq_to_gemm_layout(
-        d_entry_freq, d_gemm_freq, freq_len, entries, 0);
-    UtilKernels::gemm_freq_to_entry_layout(
-        d_gemm_freq, d_round_trip, freq_len, entries, 0);
+    cublasHandle_t handle = nullptr;
+    cublasSafeCall(cublasCreate(&handle));
+    Utils::transpose_2d(Precision::DOUBLE, d_entry_freq, d_gemm_freq,
+                        freq_len, entries, handle, 0);
+    Utils::transpose_2d(Precision::DOUBLE, d_gemm_freq, d_round_trip,
+                        entries, freq_len, handle, 0);
 
     std::vector<ComplexD> gemm_freq(count);
     std::vector<ComplexD> round_trip(count);
@@ -313,6 +316,7 @@ TEST(BlockToeplitzInverseTest, DistributedReindexRoundTrip)
     gpuErrchk(cudaFree(d_entry_freq));
     gpuErrchk(cudaFree(d_gemm_freq));
     gpuErrchk(cudaFree(d_round_trip));
+    cublasSafeCall(cublasDestroy(handle));
 }
 
 TEST(BlockToeplitzInverseTest, BuildNewtonVLocalRealOnlyAddsOwnedDiagonal)
@@ -374,6 +378,110 @@ TEST(BlockToeplitzInverseTest, BuildNewtonVLocalRealOnlyAddsOwnedDiagonal)
 
     gpuErrchk(cudaFree(d_u_ifft));
     gpuErrchk(cudaFree(d_v_real));
+}
+
+TEST(BlockToeplitzInverseTest, BuildNewtonHighCorrectionOnlyWritesUpperRange)
+{
+    if (!cuda_available())
+        GTEST_SKIP() << "CUDA device is not available.";
+
+    const int start_len = 2;
+    const int out_len = 5;
+    const int fft_len = 8;
+    const int entries = 3;
+    const size_t count = static_cast<size_t>(entries) * fft_len;
+    std::vector<double> u_ifft(count);
+    for (int e = 0; e < entries; ++e)
+    {
+        for (int t = 0; t < fft_len; ++t)
+            u_ifft[static_cast<size_t>(e) * fft_len + t] =
+                100.0 * e + t + 1.0;
+    }
+
+    double *d_u_ifft = nullptr;
+    double *d_v_real = nullptr;
+    gpuErrchk(cudaMalloc(&d_u_ifft, count * sizeof(double)));
+    gpuErrchk(cudaMalloc(&d_v_real, count * sizeof(double)));
+    gpuErrchk(cudaMemcpy(d_u_ifft, u_ifft.data(), count * sizeof(double),
+                         cudaMemcpyHostToDevice));
+
+    UtilKernels::build_newton_high_correction_real(
+        d_u_ifft, d_v_real, start_len, out_len, fft_len, entries, 0);
+
+    std::vector<double> v_real(count);
+    gpuErrchk(cudaMemcpy(v_real.data(), d_v_real, count * sizeof(double),
+                         cudaMemcpyDeviceToHost));
+
+    for (int e = 0; e < entries; ++e)
+    {
+        for (int t = 0; t < fft_len; ++t)
+        {
+            const size_t idx = static_cast<size_t>(e) * fft_len + t;
+            const double expected =
+                (t >= start_len && t < out_len)
+                    ? -u_ifft[idx] / static_cast<double>(fft_len)
+                    : 0.0;
+            EXPECT_DOUBLE_EQ(v_real[idx], expected);
+        }
+    }
+
+    gpuErrchk(cudaFree(d_u_ifft));
+    gpuErrchk(cudaFree(d_v_real));
+}
+
+TEST(BlockToeplitzInverseTest, UnpackEntryRealRangeOnlyUpdatesUpperRange)
+{
+    if (!cuda_available())
+        GTEST_SKIP() << "CUDA device is not available.";
+
+    const int start_len = 2;
+    const int out_len = 5;
+    const int coeff_len = 6;
+    const int fft_len = 8;
+    const int entries = 3;
+    const size_t entry_count = static_cast<size_t>(entries) * fft_len;
+    const size_t coeff_count = static_cast<size_t>(coeff_len) * entries;
+
+    std::vector<double> entry_real(entry_count);
+    for (int e = 0; e < entries; ++e)
+    {
+        for (int t = 0; t < fft_len; ++t)
+            entry_real[static_cast<size_t>(e) * fft_len + t] =
+                100.0 * e + t + 1.0;
+    }
+    std::vector<double> blocks(coeff_count, -7.0);
+
+    double *d_entry_real = nullptr;
+    double *d_blocks = nullptr;
+    gpuErrchk(cudaMalloc(&d_entry_real, entry_count * sizeof(double)));
+    gpuErrchk(cudaMalloc(&d_blocks, coeff_count * sizeof(double)));
+    gpuErrchk(cudaMemcpy(d_entry_real, entry_real.data(),
+                         entry_count * sizeof(double), cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(d_blocks, blocks.data(), coeff_count * sizeof(double),
+                         cudaMemcpyHostToDevice));
+
+    UtilKernels::unpack_entry_real_range_to_blocks(
+        d_entry_real, d_blocks, start_len, out_len, fft_len, entries, 0);
+
+    gpuErrchk(cudaMemcpy(blocks.data(), d_blocks, coeff_count * sizeof(double),
+                         cudaMemcpyDeviceToHost));
+
+    for (int t = 0; t < coeff_len; ++t)
+    {
+        for (int e = 0; e < entries; ++e)
+        {
+            const size_t block_idx = static_cast<size_t>(t) * entries + e;
+            const double expected =
+                (t >= start_len && t < out_len)
+                    ? entry_real[static_cast<size_t>(e) * fft_len + t] /
+                          static_cast<double>(fft_len)
+                    : -7.0;
+            EXPECT_DOUBLE_EQ(blocks[block_idx], expected);
+        }
+    }
+
+    gpuErrchk(cudaFree(d_entry_real));
+    gpuErrchk(cudaFree(d_blocks));
 }
 
 TEST(BlockToeplitzInverseTest, CpuReferenceResidual)

@@ -110,6 +110,25 @@ bool is_identity_block(const double *block, int block_dim, double tolerance)
     return true;
 }
 
+bool is_local_identity_block(
+    const double *block, const BlockToeplitzInverseDistributedLayout &layout,
+    double tolerance)
+{
+    for (int local_col = 0; local_col < layout.local_cols; ++local_col)
+    {
+        for (int local_row = 0; local_row < layout.local_rows; ++local_row)
+        {
+            const int global_row = layout.local_row_start + local_row;
+            const int global_col = layout.local_col_start + local_col;
+            const double expected = (global_row == global_col) ? 1.0 : 0.0;
+            const size_t idx = cm_entry(local_row, local_col, layout.local_rows);
+            if (std::abs(block[idx] - expected) > tolerance)
+                return false;
+        }
+    }
+    return true;
+}
+
 bool is_power_of_two(int n)
 {
     return n > 0 && (n & (n - 1)) == 0;
@@ -349,7 +368,7 @@ std::string build_distributed_layout_memory_report(
         os << "  tracked_total_no_cufft_work: " << bytes_string(tracked_total)
            << "\n";
     }
-    os << "  note: full distributed Newton still needs communication scheduling.\n";
+    os << "  note: includes local working buffers and SUMMA panel buffers.\n";
     return os.str();
 }
 
@@ -796,6 +815,18 @@ std::string BlockToeplitzInverseDistributedWorkspace::memory_report() const
         num_blocks, layout, cufft_work_bytes);
 }
 
+const BlockToeplitzInverseDistributedWorkspace::PlanEntry &
+BlockToeplitzInverseDistributedWorkspace::get_plan(int requested_fft_len) const
+{
+    for (const PlanEntry &plan : plans)
+    {
+        if (plan.fft_len == requested_fft_len)
+            return plan;
+    }
+    throw std::invalid_argument(
+        "No cached distributed FFT plan for requested fft_len.");
+}
+
 void BlockToeplitzInverseDistributedWorkspace::sbgemm_freq_major(
     const ComplexD *d_a_local, const ComplexD *d_b_local,
     ComplexD *d_c_local, int freq_len, Comm &comm)
@@ -949,8 +980,8 @@ void BlockToeplitzInverse::newton_step_gpu(
     cufftSafeCall(cufftExecZ2D(plans.inverse_plan, d_work_freq_entry,
                                d_work_real));
 
-    UtilKernels::build_newton_v_real(d_work_real, d_h_real, m_next,
-                                     fft_len, block_dim, stream);
+    UtilKernels::build_newton_high_correction_real(
+        d_work_real, d_h_real, m, m_next, fft_len, entries, stream);
     cufftSafeCall(cufftExecD2Z(plans.forward_plan, d_h_real,
                                d_work_freq_entry));
     Utils::transpose_2d(Precision::DOUBLE, d_work_freq_entry, d_a_freq_major,
@@ -964,8 +995,65 @@ void BlockToeplitzInverse::newton_step_gpu(
                         cublas_handle, stream);
     cufftSafeCall(cufftExecZ2D(plans.inverse_plan, d_work_freq_entry,
                                d_work_real));
-    UtilKernels::unpack_entry_real_to_blocks(
-        d_work_real, workspace.d_h_coeff, m_next, fft_len, entries, stream);
+    UtilKernels::unpack_entry_real_range_to_blocks(
+        d_work_real, workspace.d_h_coeff, m, m_next, fft_len, entries, stream);
+}
+
+void BlockToeplitzInverse::newton_step_distributed_gpu(
+    int m, int m_next, int fft_len,
+    BlockToeplitzInverseDistributedWorkspace &workspace, Comm &comm)
+{
+    const int entries = workspace.local_entries_count;
+    const int freq_len = fft_len / 2 + 1;
+    const BlockToeplitzInverseDistributedWorkspace::PlanEntry &plans =
+        workspace.get_plan(fft_len);
+    cudaStream_t stream = workspace.stream;
+    if (stream != comm.get_stream())
+        throw std::invalid_argument(
+            "Distributed workspace stream must match Comm stream.");
+    cublasHandle_t cublas_handle = comm.get_cublasHandle();
+
+    double *d_a_real = workspace.d_left_real;
+    double *d_h_real = workspace.d_right_real;
+    double *d_work_real = workspace.d_out_real;
+    ComplexD *d_entry_freq = workspace.d_entry_freq;
+    ComplexD *d_a_freq_major = workspace.d_left_gemm_freq;
+    ComplexD *d_h_freq_major = workspace.d_right_gemm_freq;
+    ComplexD *d_work_freq_major = workspace.d_out_gemm_freq;
+
+    UtilKernels::pack_blocks_to_entry_real(
+        workspace.d_a_coeff, d_a_real, m_next, fft_len, entries, stream);
+    UtilKernels::pack_blocks_to_entry_real(
+        workspace.d_h_coeff, d_h_real, m, fft_len, entries, stream);
+
+    cufftSafeCall(cufftExecD2Z(plans.forward_plan, d_a_real, d_entry_freq));
+    Utils::transpose_2d(Precision::DOUBLE, d_entry_freq, d_a_freq_major,
+                        freq_len, entries, cublas_handle, stream);
+    cufftSafeCall(cufftExecD2Z(plans.forward_plan, d_h_real, d_entry_freq));
+    Utils::transpose_2d(Precision::DOUBLE, d_entry_freq, d_h_freq_major,
+                        freq_len, entries, cublas_handle, stream);
+
+    workspace.sbgemm_freq_major(
+        d_a_freq_major, d_h_freq_major, d_work_freq_major, freq_len, comm);
+    Utils::transpose_2d(Precision::DOUBLE, d_work_freq_major, d_entry_freq,
+                        entries, freq_len, cublas_handle, stream);
+    cufftSafeCall(cufftExecZ2D(plans.inverse_plan, d_entry_freq,
+                               d_work_real));
+
+    UtilKernels::build_newton_high_correction_real(
+        d_work_real, d_a_real, m, m_next, fft_len, entries, stream);
+    cufftSafeCall(cufftExecD2Z(plans.forward_plan, d_a_real, d_entry_freq));
+    Utils::transpose_2d(Precision::DOUBLE, d_entry_freq, d_a_freq_major,
+                        freq_len, entries, cublas_handle, stream);
+
+    workspace.sbgemm_freq_major(
+        d_h_freq_major, d_a_freq_major, d_work_freq_major, freq_len, comm);
+    Utils::transpose_2d(Precision::DOUBLE, d_work_freq_major, d_entry_freq,
+                        entries, freq_len, cublas_handle, stream);
+    cufftSafeCall(cufftExecZ2D(plans.inverse_plan, d_entry_freq,
+                               d_work_real));
+    UtilKernels::unpack_entry_real_range_to_blocks(
+        d_work_real, workspace.d_h_coeff, m, m_next, fft_len, entries, stream);
 }
 
 std::vector<double> BlockToeplitzInverse::invert_newton_gpu(
@@ -1086,6 +1174,135 @@ std::vector<double> BlockToeplitzInverse::copy_inverse_from_workspace(
                          cudaMemcpyDeviceToHost));
 
     return H;
+}
+
+void BlockToeplitzInverse::load_coefficients_distributed_gpu(
+    const std::vector<double> &local_blocks, int num_blocks,
+    const BlockToeplitzInverseDistributedLayout &layout,
+    BlockToeplitzInverseDistributedWorkspace &workspace)
+{
+    if (num_blocks <= 0)
+        throw std::invalid_argument("num_blocks must be positive.");
+    if (workspace.num_blocks < num_blocks)
+        throw std::invalid_argument(
+            "Distributed workspace coefficient capacity is too small.");
+    if (workspace.layout.local_entries() != layout.local_entries() ||
+        workspace.layout.global_block_dim != layout.global_block_dim ||
+        workspace.layout.row_rank != layout.row_rank ||
+        workspace.layout.col_rank != layout.col_rank)
+        throw std::invalid_argument(
+            "Distributed workspace layout does not match requested layout.");
+    if (!workspace.d_a_coeff || !workspace.d_h_coeff)
+        throw std::invalid_argument("Distributed workspace has not been set up.");
+
+    const size_t entries = layout.local_entries();
+    const size_t expected = static_cast<size_t>(num_blocks) * entries;
+    if (local_blocks.size() != expected)
+        throw std::invalid_argument(
+            "Local block vector has size " + std::to_string(local_blocks.size()) +
+            ", expected " + std::to_string(expected) + ".");
+    if (!is_local_identity_block(local_blocks.data(), layout, 1e-12))
+        throw std::invalid_argument(
+            "distributed Newton expects normalized local input with A_0 = I.");
+
+    const int max_fft_len = good_fft_len(2 * num_blocks);
+    if (workspace.max_fft_len < max_fft_len)
+        throw std::invalid_argument(
+            "Distributed workspace max_fft_len is too small.");
+    for (const int fft_len : newton_fft_lengths(num_blocks))
+        (void)workspace.get_plan(fft_len);
+
+    gpuErrchk(cudaMemcpyAsync(workspace.d_a_coeff, local_blocks.data(),
+                              expected * sizeof(double),
+                              cudaMemcpyHostToDevice, workspace.stream));
+}
+
+void BlockToeplitzInverse::invert_preloaded_newton_distributed_gpu(
+    int num_blocks, const BlockToeplitzInverseDistributedLayout &layout,
+    BlockToeplitzInverseDistributedWorkspace &workspace, Comm &comm)
+{
+    if (num_blocks <= 0)
+        throw std::invalid_argument("num_blocks must be positive.");
+    if (workspace.num_blocks < num_blocks)
+        throw std::invalid_argument(
+            "Distributed workspace coefficient capacity is too small.");
+    if (workspace.layout.local_entries() != layout.local_entries() ||
+        workspace.layout.global_block_dim != layout.global_block_dim ||
+        workspace.layout.row_rank != layout.row_rank ||
+        workspace.layout.col_rank != layout.col_rank)
+        throw std::invalid_argument(
+            "Distributed workspace layout does not match requested layout.");
+    if (!workspace.d_a_coeff || !workspace.d_h_coeff)
+        throw std::invalid_argument("Distributed workspace has not been set up.");
+
+    const int max_fft_len = good_fft_len(2 * num_blocks);
+    if (workspace.max_fft_len < max_fft_len)
+        throw std::invalid_argument(
+            "Distributed workspace max_fft_len is too small.");
+    for (const int fft_len : newton_fft_lengths(num_blocks))
+        (void)workspace.get_plan(fft_len);
+
+    const size_t coeff_count =
+        static_cast<size_t>(num_blocks) * layout.local_entries();
+    gpuErrchk(cudaMemsetAsync(workspace.d_h_coeff, 0,
+                              coeff_count * sizeof(double),
+                              workspace.stream));
+    UtilKernels::set_identity_local_block(
+        workspace.d_h_coeff, layout.local_row_start, layout.local_rows,
+        layout.local_col_start, layout.local_cols, workspace.stream);
+
+    int m = 1;
+    while (m < num_blocks)
+    {
+        const int m_next = std::min(2 * m, num_blocks);
+        const int fft_len = good_fft_len(2 * m_next);
+        const NvtxRange range("distributed_newton_" + std::to_string(m) +
+                              "_to_" + std::to_string(m_next) + "_fft_" +
+                              std::to_string(fft_len));
+        newton_step_distributed_gpu(m, m_next, fft_len, workspace, comm);
+        m = m_next;
+    }
+}
+
+std::vector<double> BlockToeplitzInverse::copy_inverse_from_distributed_workspace(
+    int num_blocks, const BlockToeplitzInverseDistributedLayout &layout,
+    BlockToeplitzInverseDistributedWorkspace &workspace)
+{
+    if (num_blocks <= 0)
+        throw std::invalid_argument("num_blocks must be positive.");
+    if (workspace.num_blocks < num_blocks)
+        throw std::invalid_argument(
+            "Distributed workspace coefficient capacity is too small.");
+    if (workspace.layout.local_entries() != layout.local_entries() ||
+        workspace.layout.global_block_dim != layout.global_block_dim ||
+        workspace.layout.row_rank != layout.row_rank ||
+        workspace.layout.col_rank != layout.col_rank)
+        throw std::invalid_argument(
+            "Distributed workspace layout does not match requested layout.");
+    if (!workspace.d_h_coeff)
+        throw std::invalid_argument("Distributed workspace has not been set up.");
+
+    const size_t count =
+        static_cast<size_t>(num_blocks) * layout.local_entries();
+    std::vector<double> local_h(count, 0.0);
+
+    gpuErrchk(cudaStreamSynchronize(workspace.stream));
+    gpuErrchk(cudaMemcpy(local_h.data(), workspace.d_h_coeff,
+                         count * sizeof(double), cudaMemcpyDeviceToHost));
+    return local_h;
+}
+
+std::vector<double> BlockToeplitzInverse::invert_newton_distributed_gpu(
+    const std::vector<double> &local_blocks, int num_blocks,
+    const BlockToeplitzInverseDistributedLayout &layout,
+    BlockToeplitzInverseDistributedWorkspace &workspace, Comm &comm)
+{
+    load_coefficients_distributed_gpu(
+        local_blocks, num_blocks, layout, workspace);
+    invert_preloaded_newton_distributed_gpu(
+        num_blocks, layout, workspace, comm);
+    return copy_inverse_from_distributed_workspace(
+        num_blocks, layout, workspace);
 }
 
 double BlockToeplitzInverse::residual_norm(

@@ -199,26 +199,6 @@ void pack_blocks_to_entry_real(const double *d_blocks, double *d_entry_real,
                                cudaStream_t s);
 
 /**
- * @brief Reindex FFT entry-major frequency layout to GEMM frequency-major layout.
- *
- * d_entry_freq[e * freq_len + f] -> d_gemm_freq[f * entries + e].
- * For a distributed local tile, entries = local_rows * local_cols and e is
- * the column-major local tile entry.
- */
-void entry_freq_to_gemm_layout(const ComplexD *d_entry_freq,
-                               ComplexD *d_gemm_freq, int freq_len,
-                               int entries, cudaStream_t s);
-
-/**
- * @brief Reindex GEMM frequency-major layout back to FFT entry-major layout.
- *
- * d_gemm_freq[f * entries + e] -> d_entry_freq[e * freq_len + f].
- */
-void gemm_freq_to_entry_layout(const ComplexD *d_gemm_freq,
-                               ComplexD *d_entry_freq, int freq_len,
-                               int entries, cudaStream_t s);
-
-/**
  * @brief Build V = 2I - U in entry-major real FFT layout after an unnormalized IFFT.
  */
 void build_newton_v_real(const double *d_u_ifft, double *d_v_real,
@@ -238,11 +218,39 @@ void build_newton_v_local_real(const double *d_u_ifft, double *d_v_real,
                                cudaStream_t s);
 
 /**
+ * @brief Build the high-order Newton correction V_high = -U_high.
+ *
+ * Coefficients outside [start_len, out_len) are zeroed. This lets Newton
+ * doubling preserve the already-correct lower coefficients and update only the
+ * newly exposed block rows.
+ */
+void build_newton_high_correction_real(const double *d_u_ifft, double *d_v_real,
+                                       int start_len, int out_len, int fft_len,
+                                       int entries, cudaStream_t s);
+
+/**
+ * @brief Set one local tile of an identity matrix in column-major storage.
+ */
+void set_identity_local_block(double *d_block,
+                              int local_row_start, int local_rows,
+                              int local_col_start, int local_cols,
+                              cudaStream_t s);
+
+/**
  * @brief Scale unnormalized IFFT output and store it as coefficient-major blocks.
  */
 void unpack_entry_real_to_blocks(const double *d_entry_real, double *d_blocks,
                                  int out_len, int fft_len, int entries,
                                  cudaStream_t s);
+
+/**
+ * @brief Scale unnormalized IFFT output and update a coefficient range.
+ */
+void unpack_entry_real_range_to_blocks(const double *d_entry_real,
+                                       double *d_blocks,
+                                       int start_len, int out_len,
+                                       int fft_len, int entries,
+                                       cudaStream_t s);
 
 /**
  * @brief Initialize one column-major block to identity on the GPU.

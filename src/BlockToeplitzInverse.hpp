@@ -129,6 +129,8 @@ private:
     double *d_a_coeff = nullptr;
     double *d_h_coeff = nullptr;
 
+    const PlanEntry &get_plan(int fft_len) const;
+
 public:
     BlockToeplitzInverseDistributedWorkspace() = default;
     ~BlockToeplitzInverseDistributedWorkspace();
@@ -154,6 +156,8 @@ public:
                            const ComplexD *d_b_local,
                            ComplexD *d_c_local,
                            int freq_len, Comm &comm);
+
+    friend class BlockToeplitzInverse;
 };
 
 /**
@@ -222,6 +226,39 @@ public:
         int num_blocks, int block_dim, BlockToeplitzInverseWorkspace &workspace);
 
     /**
+     * @brief Copy normalized local coefficient tiles into distributed workspace.
+     *
+     * local_blocks is coefficient-major local tile storage:
+     *     local_blocks[t * local_entries + local_col * local_rows + local_row]
+     */
+    static void load_coefficients_distributed_gpu(
+        const std::vector<double> &local_blocks, int num_blocks,
+        const BlockToeplitzInverseDistributedLayout &layout,
+        BlockToeplitzInverseDistributedWorkspace &workspace);
+
+    /**
+     * @brief Run distributed Newton doubling using local A already loaded.
+     */
+    static void invert_preloaded_newton_distributed_gpu(
+        int num_blocks, const BlockToeplitzInverseDistributedLayout &layout,
+        BlockToeplitzInverseDistributedWorkspace &workspace, Comm &comm);
+
+    /**
+     * @brief Copy this rank's local inverse tile from a distributed workspace.
+     */
+    static std::vector<double> copy_inverse_from_distributed_workspace(
+        int num_blocks, const BlockToeplitzInverseDistributedLayout &layout,
+        BlockToeplitzInverseDistributedWorkspace &workspace);
+
+    /**
+     * @brief Compute this rank's local tile of A^{-1} with distributed GEMM.
+     */
+    static std::vector<double> invert_newton_distributed_gpu(
+        const std::vector<double> &local_blocks, int num_blocks,
+        const BlockToeplitzInverseDistributedLayout &layout,
+        BlockToeplitzInverseDistributedWorkspace &workspace, Comm &comm);
+
+    /**
      * @brief Frobenius norm of A * H - I modulo t^num_blocks.
      */
     static double residual_norm(
@@ -242,6 +279,10 @@ private:
     static void newton_step_gpu(
         int m, int m_next, int block_dim, int fft_len,
         BlockToeplitzInverseWorkspace &workspace);
+
+    static void newton_step_distributed_gpu(
+        int m, int m_next, int fft_len,
+        BlockToeplitzInverseDistributedWorkspace &workspace, Comm &comm);
 };
 
 #endif // __BLOCK_TOEPLITZ_INVERSE_HPP__

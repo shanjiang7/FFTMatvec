@@ -573,30 +573,6 @@ __global__ void pack_blocks_to_entry_real_kernel(const double *d_blocks,
   }
 }
 
-__global__ void entry_freq_to_gemm_layout_kernel(const ComplexD *d_entry_freq,
-                                                 ComplexD *d_gemm_freq,
-                                                 int freq_len, int entries,
-                                                 size_t total) {
-  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
-       idx += (size_t)blockDim.x * gridDim.x) {
-    const int f = static_cast<int>(idx % freq_len);
-    const int e = static_cast<int>(idx / freq_len);
-    d_gemm_freq[(size_t)f * entries + e] = d_entry_freq[idx];
-  }
-}
-
-__global__ void gemm_freq_to_entry_layout_kernel(const ComplexD *d_gemm_freq,
-                                                 ComplexD *d_entry_freq,
-                                                 int freq_len, int entries,
-                                                 size_t total) {
-  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
-       idx += (size_t)blockDim.x * gridDim.x) {
-    const int e = static_cast<int>(idx % entries);
-    const int f = static_cast<int>(idx / entries);
-    d_entry_freq[(size_t)e * freq_len + f] = d_gemm_freq[idx];
-  }
-}
-
 __global__ void build_newton_v_real_kernel(const double *d_u_ifft,
                                            double *d_v_real, int out_len,
                                            int fft_len, int block_dim,
@@ -640,6 +616,19 @@ __global__ void build_newton_v_local_real_kernel(
   }
 }
 
+__global__ void build_newton_high_correction_real_kernel(
+    const double *d_u_ifft, double *d_v_real, int start_len, int out_len,
+    int fft_len, size_t total) {
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += (size_t)blockDim.x * gridDim.x) {
+    const int t = static_cast<int>(idx % fft_len);
+    double value = 0.0;
+    if (t >= start_len && t < out_len)
+      value = -d_u_ifft[idx] / static_cast<double>(fft_len);
+    d_v_real[idx] = value;
+  }
+}
+
 __global__ void unpack_entry_real_to_blocks_kernel(const double *d_entry_real,
                                                    double *d_blocks,
                                                    int out_len, int fft_len,
@@ -654,6 +643,19 @@ __global__ void unpack_entry_real_to_blocks_kernel(const double *d_entry_real,
   }
 }
 
+__global__ void unpack_entry_real_range_to_blocks_kernel(
+    const double *d_entry_real, double *d_blocks, int start_len, int out_len,
+    int fft_len, int entries, size_t total) {
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += (size_t)blockDim.x * gridDim.x) {
+    const int e = static_cast<int>(idx % entries);
+    const int t = start_len + static_cast<int>(idx / entries);
+    if (t < out_len)
+      d_blocks[(size_t)t * entries + e] =
+          d_entry_real[(size_t)e * fft_len + t] / static_cast<double>(fft_len);
+  }
+}
+
 __global__ void set_identity_block_kernel(double *d_block, int block_dim,
                                           int entries) {
   for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < entries;
@@ -661,6 +663,19 @@ __global__ void set_identity_block_kernel(double *d_block, int block_dim,
     const int row = e % block_dim;
     const int col = e / block_dim;
     d_block[e] = (row == col) ? 1.0 : 0.0;
+  }
+}
+
+__global__ void set_identity_local_block_kernel(
+    double *d_block, int local_row_start, int local_rows,
+    int local_col_start, int entries) {
+  for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < entries;
+       e += blockDim.x * gridDim.x) {
+    const int local_row = e % local_rows;
+    const int local_col = e / local_rows;
+    const int global_row = local_row_start + local_row;
+    const int global_col = local_col_start + local_col;
+    d_block[e] = (global_row == global_col) ? 1.0 : 0.0;
   }
 }
 
@@ -678,30 +693,6 @@ void UtilKernels::pack_blocks_to_entry_real(const double *d_blocks,
     return;
   pack_blocks_to_entry_real_kernel<<<inverse_kernel_blocks(total), 256, 0, s>>>(
       d_blocks, d_entry_real, block_len, fft_len, entries, total);
-  gpuErrchk(cudaPeekAtLastError());
-}
-
-void UtilKernels::entry_freq_to_gemm_layout(const ComplexD *d_entry_freq,
-                                            ComplexD *d_gemm_freq,
-                                            int freq_len, int entries,
-                                            cudaStream_t s) {
-  const size_t total = static_cast<size_t>(entries) * freq_len;
-  if (total == 0)
-    return;
-  entry_freq_to_gemm_layout_kernel<<<inverse_kernel_blocks(total), 256, 0, s>>>(
-      d_entry_freq, d_gemm_freq, freq_len, entries, total);
-  gpuErrchk(cudaPeekAtLastError());
-}
-
-void UtilKernels::gemm_freq_to_entry_layout(const ComplexD *d_gemm_freq,
-                                            ComplexD *d_entry_freq,
-                                            int freq_len, int entries,
-                                            cudaStream_t s) {
-  const size_t total = static_cast<size_t>(entries) * freq_len;
-  if (total == 0)
-    return;
-  gemm_freq_to_entry_layout_kernel<<<inverse_kernel_blocks(total), 256, 0, s>>>(
-      d_gemm_freq, d_entry_freq, freq_len, entries, total);
   gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -728,6 +719,45 @@ void UtilKernels::build_newton_v_local_real(
   build_newton_v_local_real_kernel<<<inverse_kernel_blocks(total), 256, 0, s>>>(
       d_u_ifft, d_v_real, out_len, fft_len, local_row_start, local_rows,
       local_col_start, total);
+  gpuErrchk(cudaPeekAtLastError());
+}
+
+void UtilKernels::build_newton_high_correction_real(
+    const double *d_u_ifft, double *d_v_real, int start_len, int out_len,
+    int fft_len, int entries, cudaStream_t s) {
+  const size_t total = static_cast<size_t>(entries) * fft_len;
+  if (total == 0)
+    return;
+  build_newton_high_correction_real_kernel<<<inverse_kernel_blocks(total), 256,
+                                             0, s>>>(
+      d_u_ifft, d_v_real, start_len, out_len, fft_len, total);
+  gpuErrchk(cudaPeekAtLastError());
+}
+
+void UtilKernels::set_identity_local_block(double *d_block,
+                                           int local_row_start,
+                                           int local_rows,
+                                           int local_col_start,
+                                           int local_cols,
+                                           cudaStream_t s) {
+  const int entries = local_rows * local_cols;
+  if (entries == 0)
+    return;
+  set_identity_local_block_kernel<<<inverse_kernel_blocks(entries), 256, 0, s>>>(
+      d_block, local_row_start, local_rows, local_col_start, entries);
+  gpuErrchk(cudaPeekAtLastError());
+}
+
+void UtilKernels::unpack_entry_real_range_to_blocks(
+    const double *d_entry_real, double *d_blocks, int start_len, int out_len,
+    int fft_len, int entries, cudaStream_t s) {
+  const size_t total =
+      static_cast<size_t>(std::max(0, out_len - start_len)) * entries;
+  if (total == 0)
+    return;
+  unpack_entry_real_range_to_blocks_kernel<<<inverse_kernel_blocks(total), 256,
+                                             0, s>>>(
+      d_entry_real, d_blocks, start_len, out_len, fft_len, entries, total);
   gpuErrchk(cudaPeekAtLastError());
 }
 
