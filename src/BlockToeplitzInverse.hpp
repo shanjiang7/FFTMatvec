@@ -80,6 +80,17 @@ public:
         cudaStream_t stream = 0);
 
     /**
+     * @brief Compute A^{-1} using a caller-owned workspace.
+     *
+     * The workspace must have been set up with max_fft_len >= next_pow2(2*num_blocks)
+     * and the same block_dim. This path is intended for warm benchmarks and repeated
+     * solves where cuBLAS handles, cuFFT plans, and GPU buffers should be reused.
+     */
+    static std::vector<double> invert_newton_gpu(
+        const std::vector<double> &blocks, int num_blocks, int block_dim,
+        BlockToeplitzInverseWorkspace &workspace);
+
+    /**
      * @brief Frobenius norm of A * H - I modulo t^num_blocks.
      */
     static double residual_norm(

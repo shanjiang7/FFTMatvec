@@ -6,6 +6,17 @@
 #include <stdexcept>
 #include <vector>
 
+#if defined(__has_include)
+#if __has_include(<cuda_profiler_api.h>)
+#include <cuda_profiler_api.h>
+#define BLOCK_TOEPLITZ_HAS_CUDA_PROFILER_API 1
+#endif
+#endif
+
+#ifndef BLOCK_TOEPLITZ_HAS_CUDA_PROFILER_API
+#define BLOCK_TOEPLITZ_HAS_CUDA_PROFILER_API 0
+#endif
+
 namespace
 {
 size_t block_entry(int block, int entry_count, int entry)
@@ -89,6 +100,20 @@ bool cuda_available()
     int device_count = 0;
     const cudaError_t device_err = cudaGetDeviceCount(&device_count);
     return device_err == cudaSuccess && device_count > 0;
+}
+
+void profiler_start()
+{
+#if BLOCK_TOEPLITZ_HAS_CUDA_PROFILER_API
+    gpuErrchk(cudaProfilerStart());
+#endif
+}
+
+void profiler_stop()
+{
+#if BLOCK_TOEPLITZ_HAS_CUDA_PROFILER_API
+    gpuErrchk(cudaProfilerStop());
+#endif
 }
 
 } // namespace
@@ -185,13 +210,44 @@ TEST(BlockToeplitzInverseTest, BenchmarkNsysLarge)
     if (!cuda_available())
         GTEST_SKIP() << "CUDA device is not available.";
 
-    const int num_blocks = 1024;
-    const int block_dim = 128;
+    const int num_blocks = 2048;
+    const int block_dim = 256;
     const std::vector<double> A =
-        make_normalized_problem(num_blocks, block_dim, 0.005);
+        make_normalized_problem(num_blocks, block_dim, 0.001);
 
     const std::vector<double> H =
         BlockToeplitzInverse::invert_newton_gpu(A, num_blocks, block_dim);
+
+    ASSERT_EQ(H.size(), static_cast<size_t>(num_blocks) * block_dim * block_dim);
+    ASSERT_NEAR(H[0], 1.0, 1e-10);
+    ASSERT_TRUE(std::isfinite(H.back()));
+}
+
+TEST(BlockToeplitzInverseTest, BenchmarkNsysWarmLarge)
+{
+    if (!cuda_available())
+        GTEST_SKIP() << "CUDA device is not available.";
+
+    const int num_blocks = 2048;
+    const int block_dim = 256;
+    const std::vector<double> A =
+        make_normalized_problem(num_blocks, block_dim, 0.001);
+
+    BlockToeplitzInverseWorkspace workspace;
+    workspace.setup(BlockToeplitzInverse::next_pow2(2 * num_blocks), block_dim);
+
+    {
+        const std::vector<double> warmup =
+            BlockToeplitzInverse::invert_newton_gpu(A, num_blocks, block_dim, workspace);
+        ASSERT_EQ(warmup.size(), static_cast<size_t>(num_blocks) * block_dim * block_dim);
+    }
+    gpuErrchk(cudaDeviceSynchronize());
+
+    profiler_start();
+    const std::vector<double> H =
+        BlockToeplitzInverse::invert_newton_gpu(A, num_blocks, block_dim, workspace);
+    gpuErrchk(cudaDeviceSynchronize());
+    profiler_stop();
 
     ASSERT_EQ(H.size(), static_cast<size_t>(num_blocks) * block_dim * block_dim);
     ASSERT_NEAR(H[0], 1.0, 1e-10);
