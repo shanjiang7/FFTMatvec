@@ -1,9 +1,11 @@
 #include "BlockToeplitzInverse.hpp"
+#include "util_kernels.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <gtest/gtest.h>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -150,6 +152,30 @@ double env_double(const char *name, double fallback)
     }
 }
 
+bool env_flag(const char *name)
+{
+    const char *value = std::getenv(name);
+    return value != nullptr && std::string(value) != "0";
+}
+
+int env_rank()
+{
+    const char *names[] = {
+        "BTI_DIST_WORLD_RANK",
+        "SLURM_PROCID",
+        "PMI_RANK",
+        "OMPI_COMM_WORLD_RANK",
+        "MV2_COMM_WORLD_RANK",
+    };
+    for (const char *name : names)
+    {
+        const char *value = std::getenv(name);
+        if (value)
+            return std::stoi(value);
+    }
+    return 0;
+}
+
 } // namespace
 
 TEST(BlockToeplitzInverseTest, NextPow2)
@@ -214,6 +240,140 @@ TEST(BlockToeplitzInverseTest, DistributedLayoutHandlesUnevenBlockDim)
     EXPECT_THROW(BlockToeplitzInverseDistributedLayout::create(
                      block_dim, 3, 2, 3, 0),
                  std::invalid_argument);
+}
+
+TEST(BlockToeplitzInverseTest, DistributedLayoutReportsLocalMemory)
+{
+    const BlockToeplitzInverseDistributedLayout layout =
+        BlockToeplitzInverseDistributedLayout::create(400, 2, 2, 1, 0);
+    const std::string report = layout.memory_report(8192);
+
+    EXPECT_NE(report.find("BlockToeplitzInverseDistributedLayoutMemory"),
+              std::string::npos);
+    EXPECT_NE(report.find("local_rows:       [200, 400) size=200"),
+              std::string::npos);
+    EXPECT_NE(report.find("local_cols:       [0, 200) size=200"),
+              std::string::npos);
+    EXPECT_NE(report.find("tracked_total_no_cufft_work"), std::string::npos);
+}
+
+TEST(BlockToeplitzInverseTest, DistributedReindexRoundTrip)
+{
+    if (!cuda_available())
+        GTEST_SKIP() << "CUDA device is not available.";
+
+    const int entries = 6;
+    const int freq_len = 5;
+    const size_t count = static_cast<size_t>(entries) * freq_len;
+    std::vector<ComplexD> entry_freq(count);
+    for (int e = 0; e < entries; ++e)
+    {
+        for (int f = 0; f < freq_len; ++f)
+        {
+            const double value = 100.0 * e + f;
+            entry_freq[static_cast<size_t>(e) * freq_len + f] =
+                make_cuDoubleComplex(value, -value);
+        }
+    }
+
+    ComplexD *d_entry_freq = nullptr;
+    ComplexD *d_gemm_freq = nullptr;
+    ComplexD *d_round_trip = nullptr;
+    gpuErrchk(cudaMalloc(&d_entry_freq, count * sizeof(ComplexD)));
+    gpuErrchk(cudaMalloc(&d_gemm_freq, count * sizeof(ComplexD)));
+    gpuErrchk(cudaMalloc(&d_round_trip, count * sizeof(ComplexD)));
+    gpuErrchk(cudaMemcpy(d_entry_freq, entry_freq.data(), count * sizeof(ComplexD),
+                         cudaMemcpyHostToDevice));
+
+    UtilKernels::entry_freq_to_gemm_layout(
+        d_entry_freq, d_gemm_freq, freq_len, entries, 0);
+    UtilKernels::gemm_freq_to_entry_layout(
+        d_gemm_freq, d_round_trip, freq_len, entries, 0);
+
+    std::vector<ComplexD> gemm_freq(count);
+    std::vector<ComplexD> round_trip(count);
+    gpuErrchk(cudaMemcpy(gemm_freq.data(), d_gemm_freq, count * sizeof(ComplexD),
+                         cudaMemcpyDeviceToHost));
+    gpuErrchk(cudaMemcpy(round_trip.data(), d_round_trip, count * sizeof(ComplexD),
+                         cudaMemcpyDeviceToHost));
+
+    for (int e = 0; e < entries; ++e)
+    {
+        for (int f = 0; f < freq_len; ++f)
+        {
+            const size_t entry_idx = static_cast<size_t>(e) * freq_len + f;
+            const size_t gemm_idx = static_cast<size_t>(f) * entries + e;
+            EXPECT_DOUBLE_EQ(gemm_freq[gemm_idx].x, entry_freq[entry_idx].x);
+            EXPECT_DOUBLE_EQ(gemm_freq[gemm_idx].y, entry_freq[entry_idx].y);
+            EXPECT_DOUBLE_EQ(round_trip[entry_idx].x, entry_freq[entry_idx].x);
+            EXPECT_DOUBLE_EQ(round_trip[entry_idx].y, entry_freq[entry_idx].y);
+        }
+    }
+
+    gpuErrchk(cudaFree(d_entry_freq));
+    gpuErrchk(cudaFree(d_gemm_freq));
+    gpuErrchk(cudaFree(d_round_trip));
+}
+
+TEST(BlockToeplitzInverseTest, BuildNewtonVLocalRealOnlyAddsOwnedDiagonal)
+{
+    if (!cuda_available())
+        GTEST_SKIP() << "CUDA device is not available.";
+
+    const int out_len = 3;
+    const int fft_len = 4;
+    const int local_row_start = 1;
+    const int local_rows = 2;
+    const int local_col_start = 0;
+    const int local_cols = 3;
+    const int entries = local_rows * local_cols;
+    const size_t count = static_cast<size_t>(entries) * fft_len;
+    std::vector<double> u_ifft(count);
+    for (int e = 0; e < entries; ++e)
+    {
+        for (int t = 0; t < fft_len; ++t)
+            u_ifft[static_cast<size_t>(e) * fft_len + t] =
+                10.0 * e + t + 1.0;
+    }
+
+    double *d_u_ifft = nullptr;
+    double *d_v_real = nullptr;
+    gpuErrchk(cudaMalloc(&d_u_ifft, count * sizeof(double)));
+    gpuErrchk(cudaMalloc(&d_v_real, count * sizeof(double)));
+    gpuErrchk(cudaMemcpy(d_u_ifft, u_ifft.data(), count * sizeof(double),
+                         cudaMemcpyHostToDevice));
+
+    UtilKernels::build_newton_v_local_real(
+        d_u_ifft, d_v_real, out_len, fft_len,
+        local_row_start, local_rows, local_col_start, local_cols, 0);
+
+    std::vector<double> v_real(count);
+    gpuErrchk(cudaMemcpy(v_real.data(), d_v_real, count * sizeof(double),
+                         cudaMemcpyDeviceToHost));
+
+    for (int e = 0; e < entries; ++e)
+    {
+        const int local_row = e % local_rows;
+        const int local_col = e / local_rows;
+        const int global_row = local_row_start + local_row;
+        const int global_col = local_col_start + local_col;
+        for (int t = 0; t < fft_len; ++t)
+        {
+            double expected = 0.0;
+            if (t < out_len)
+            {
+                expected = -u_ifft[static_cast<size_t>(e) * fft_len + t] /
+                           static_cast<double>(fft_len);
+                if (t == 0 && global_row == global_col)
+                    expected += 2.0;
+            }
+            EXPECT_DOUBLE_EQ(v_real[static_cast<size_t>(e) * fft_len + t],
+                             expected);
+        }
+    }
+
+    gpuErrchk(cudaFree(d_u_ifft));
+    gpuErrchk(cudaFree(d_v_real));
 }
 
 TEST(BlockToeplitzInverseTest, CpuReferenceResidual)
@@ -345,4 +505,44 @@ TEST(BlockToeplitzInverseTest, BenchmarkNsysWarmLarge)
     ASSERT_EQ(H.size(), static_cast<size_t>(num_blocks) * block_dim * block_dim);
     ASSERT_NEAR(H[0], 1.0, 1e-10);
     ASSERT_TRUE(std::isfinite(H.back()));
+}
+
+TEST(BlockToeplitzInverseTest, DistributedWorkspaceAllocation)
+{
+    if (!env_flag("BTI_RUN_DISTRIBUTED_WORKSPACE_TEST"))
+        GTEST_SKIP() << "Set BTI_RUN_DISTRIBUTED_WORKSPACE_TEST=1 to allocate "
+                        "the distributed workspace skeleton.";
+    if (!cuda_available())
+        GTEST_SKIP() << "CUDA device is not available.";
+
+    int device_count = 0;
+    gpuErrchk(cudaGetDeviceCount(&device_count));
+
+    const int num_blocks = env_int("BTI_BENCH_T", 8192);
+    const int block_dim = env_int("BTI_BENCH_R", 400);
+    const int proc_rows = env_int("BTI_DIST_PROC_ROWS", 2);
+    const int proc_cols = env_int("BTI_DIST_PROC_COLS", 2);
+    const int world_rank = env_rank();
+    const int row_rank = env_int("BTI_DIST_ROW_RANK", world_rank % proc_rows);
+    const int col_rank = env_int("BTI_DIST_COL_RANK", world_rank / proc_rows);
+    const int device = env_int("BTI_DIST_DEVICE", world_rank % device_count);
+
+    gpuErrchk(cudaSetDevice(device));
+
+    const BlockToeplitzInverseDistributedLayout layout =
+        BlockToeplitzInverseDistributedLayout::create(
+            block_dim, proc_rows, proc_cols, row_rank, col_rank);
+
+    if (env_flag("BTI_DIST_REPORT_ONLY"))
+    {
+        std::cerr << layout.memory_report(num_blocks);
+        return;
+    }
+
+    if (env_flag("BTI_PRINT_WORKSPACE"))
+        std::cerr << layout.memory_report(num_blocks);
+
+    BlockToeplitzInverseDistributedWorkspace workspace;
+    workspace.setup_for_problem(num_blocks, layout);
+    gpuErrchk(cudaDeviceSynchronize());
 }

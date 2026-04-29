@@ -2,6 +2,7 @@
 #define __BLOCK_TOEPLITZ_INVERSE_HPP__
 
 #include "shared.hpp"
+#include <string>
 #include <vector>
 
 struct BlockToeplitzInverseDistributedLayout
@@ -22,6 +23,11 @@ struct BlockToeplitzInverseDistributedLayout
 
     size_t local_entries() const;
     size_t global_entries() const;
+
+    /**
+     * @brief Estimate the per-rank local workspace size for this layout.
+     */
+    std::string memory_report(int num_blocks) const;
 };
 
 class BlockToeplitzInverseWorkspace
@@ -79,6 +85,60 @@ public:
     std::string memory_report() const;
 
     friend class BlockToeplitzInverse;
+};
+
+/**
+ * @brief Per-rank workspace for the distributed Newton path.
+ *
+ * This owns only one 2D process-grid tile of each r x r block. FFT buffers are
+ * entry-major for local cuFFT batches; GEMM buffers are frequency-major, so the
+ * distributed path explicitly reindexes before and after distributed GEMM.
+ */
+class BlockToeplitzInverseDistributedWorkspace
+{
+private:
+    struct PlanEntry
+    {
+        int fft_len = 0;
+        int freq_len = 0;
+        cufftHandle forward_plan = 0;
+        cufftHandle inverse_plan = 0;
+    };
+
+    int num_blocks = 0;
+    int max_fft_len = 0;
+    int max_freq_len = 0;
+    int local_entries_count = 0;
+    cudaStream_t stream = 0;
+    BlockToeplitzInverseDistributedLayout layout;
+    std::vector<PlanEntry> plans;
+    void *d_cufft_work = nullptr;
+    size_t cufft_work_bytes = 0;
+
+    double *d_left_real = nullptr;
+    double *d_right_real = nullptr;
+    double *d_out_real = nullptr;
+    ComplexD *d_entry_freq = nullptr;
+    ComplexD *d_left_gemm_freq = nullptr;
+    ComplexD *d_right_gemm_freq = nullptr;
+    ComplexD *d_out_gemm_freq = nullptr;
+    double *d_a_coeff = nullptr;
+    double *d_h_coeff = nullptr;
+
+public:
+    BlockToeplitzInverseDistributedWorkspace() = default;
+    ~BlockToeplitzInverseDistributedWorkspace();
+
+    BlockToeplitzInverseDistributedWorkspace(
+        const BlockToeplitzInverseDistributedWorkspace &) = delete;
+    BlockToeplitzInverseDistributedWorkspace &operator=(
+        const BlockToeplitzInverseDistributedWorkspace &) = delete;
+
+    void setup_for_problem(int num_blocks,
+                           const BlockToeplitzInverseDistributedLayout &layout,
+                           cudaStream_t stream = 0);
+    void cleanup();
+    std::string memory_report() const;
 };
 
 /**

@@ -278,6 +278,63 @@ std::string build_workspace_memory_report(
     return os.str();
 }
 
+std::string build_distributed_layout_memory_report(
+    int num_blocks, const BlockToeplitzInverseDistributedLayout &layout,
+    size_t cufft_work_bytes)
+{
+    const std::vector<int> fft_lengths = newton_fft_lengths(num_blocks);
+    const int max_fft_len = fft_lengths.back();
+    const int max_freq_len = max_fft_len / 2 + 1;
+    const size_t entries = layout.local_entries();
+    const size_t real_count = entries * max_fft_len;
+    const size_t freq_count = entries * max_freq_len;
+    const size_t coeff_count = static_cast<size_t>(num_blocks) * entries;
+
+    std::ostringstream os;
+    os << "\n[BlockToeplitzInverseDistributedLayoutMemory]\n";
+    os << "  num_blocks:       " << num_blocks << "\n";
+    os << "  global_block_dim: " << layout.global_block_dim << "\n";
+    os << "  process_grid:     " << layout.proc_rows << " x "
+       << layout.proc_cols << "\n";
+    os << "  rank_tile:        (" << layout.row_rank << ", "
+       << layout.col_rank << ")\n";
+    os << "  local_rows:       [" << layout.local_row_start << ", "
+       << layout.local_row_start + layout.local_rows << ") size="
+       << layout.local_rows << "\n";
+    os << "  local_cols:       [" << layout.local_col_start << ", "
+       << layout.local_col_start + layout.local_cols << ") size="
+       << layout.local_cols << "\n";
+    os << "  local_entries:    " << entries << " of "
+       << layout.global_entries() << "\n";
+    os << "  max_fft_len:      " << max_fft_len << "\n";
+    os << "  max_freq_len:     " << max_freq_len << "\n";
+    os << "  fft_lengths:      " << join_ints(fft_lengths) << "\n";
+
+    long double tracked_total = 0.0L;
+    os << "  local buffers before distributed GEMM communication:\n";
+    append_buffer_report(os, "real work buffers", real_count, sizeof(double),
+                         3, tracked_total);
+    append_buffer_report(os, "freq entry buffer", freq_count, sizeof(ComplexD),
+                         1, tracked_total);
+    append_buffer_report(os, "freq gemm buffers", freq_count, sizeof(ComplexD),
+                         3, tracked_total);
+    append_buffer_report(os, "coefficient buffers", coeff_count, sizeof(double),
+                         2, tracked_total);
+    if (cufft_work_bytes > 0)
+    {
+        append_buffer_report(os, "shared cufft work", 1, cufft_work_bytes,
+                             1, tracked_total);
+        os << "  tracked_total:    " << bytes_string(tracked_total) << "\n";
+    }
+    else
+    {
+        os << "  tracked_total_no_cufft_work: " << bytes_string(tracked_total)
+           << "\n";
+    }
+    os << "  note: SUMMA panel buffers are not included.\n";
+    return os.str();
+}
+
 } // namespace
 
 BlockToeplitzInverseDistributedLayout
@@ -310,6 +367,14 @@ size_t BlockToeplitzInverseDistributedLayout::local_entries() const
 size_t BlockToeplitzInverseDistributedLayout::global_entries() const
 {
     return static_cast<size_t>(global_block_dim) * global_block_dim;
+}
+
+std::string BlockToeplitzInverseDistributedLayout::memory_report(
+    int num_blocks) const
+{
+    if (num_blocks <= 0)
+        throw std::invalid_argument("num_blocks must be positive.");
+    return build_distributed_layout_memory_report(num_blocks, *this, 0);
 }
 
 BlockToeplitzInverseWorkspace::~BlockToeplitzInverseWorkspace()
@@ -505,6 +570,153 @@ std::string BlockToeplitzInverseWorkspace::memory_report() const
     return build_workspace_memory_report(
         max_coeff_blocks, block_dim, entries, max_fft_len, max_freq_len,
         cufft_work_bytes, fft_lengths);
+}
+
+BlockToeplitzInverseDistributedWorkspace::~BlockToeplitzInverseDistributedWorkspace()
+{
+    cleanup();
+}
+
+void BlockToeplitzInverseDistributedWorkspace::cleanup()
+{
+    for (PlanEntry &plan : plans)
+    {
+        if (plan.forward_plan)
+            cufftSafeCall(cufftDestroy(plan.forward_plan));
+        if (plan.inverse_plan)
+            cufftSafeCall(cufftDestroy(plan.inverse_plan));
+    }
+    plans.clear();
+
+    if (d_cufft_work)
+        gpuErrchk(cudaFree(d_cufft_work));
+    if (d_left_real)
+        gpuErrchk(cudaFree(d_left_real));
+    if (d_right_real)
+        gpuErrchk(cudaFree(d_right_real));
+    if (d_out_real)
+        gpuErrchk(cudaFree(d_out_real));
+    if (d_entry_freq)
+        gpuErrchk(cudaFree(d_entry_freq));
+    if (d_left_gemm_freq)
+        gpuErrchk(cudaFree(d_left_gemm_freq));
+    if (d_right_gemm_freq)
+        gpuErrchk(cudaFree(d_right_gemm_freq));
+    if (d_out_gemm_freq)
+        gpuErrchk(cudaFree(d_out_gemm_freq));
+    if (d_a_coeff)
+        gpuErrchk(cudaFree(d_a_coeff));
+    if (d_h_coeff)
+        gpuErrchk(cudaFree(d_h_coeff));
+
+    d_cufft_work = nullptr;
+    d_left_real = nullptr;
+    d_right_real = nullptr;
+    d_out_real = nullptr;
+    d_entry_freq = nullptr;
+    d_left_gemm_freq = nullptr;
+    d_right_gemm_freq = nullptr;
+    d_out_gemm_freq = nullptr;
+    d_a_coeff = nullptr;
+    d_h_coeff = nullptr;
+
+    num_blocks = 0;
+    max_fft_len = 0;
+    max_freq_len = 0;
+    local_entries_count = 0;
+    stream = 0;
+    layout = BlockToeplitzInverseDistributedLayout();
+    cufft_work_bytes = 0;
+}
+
+void BlockToeplitzInverseDistributedWorkspace::setup_for_problem(
+    int requested_num_blocks,
+    const BlockToeplitzInverseDistributedLayout &requested_layout,
+    cudaStream_t requested_stream)
+{
+    cleanup();
+
+    if (requested_num_blocks <= 0)
+        throw std::invalid_argument("num_blocks must be positive.");
+    if (requested_layout.local_entries() == 0)
+        throw std::invalid_argument("Distributed layout owns no local entries.");
+
+    num_blocks = requested_num_blocks;
+    layout = requested_layout;
+    local_entries_count = static_cast<int>(layout.local_entries());
+    const std::vector<int> fft_lengths = newton_fft_lengths(num_blocks);
+    max_fft_len = fft_lengths.back();
+    max_freq_len = max_fft_len / 2 + 1;
+    stream = requested_stream;
+
+    for (const int fft_len : fft_lengths)
+    {
+        PlanEntry plan;
+        plan.fft_len = fft_len;
+        plan.freq_len = fft_len / 2 + 1;
+        int n[1] = {fft_len};
+        size_t forward_work_bytes = 0;
+        size_t inverse_work_bytes = 0;
+
+        cufftSafeCall(cufftCreate(&plan.forward_plan));
+        cufftSafeCall(cufftSetAutoAllocation(plan.forward_plan, 0));
+        cufftSafeCall(cufftMakePlanMany(plan.forward_plan, 1, n, nullptr, 1,
+                                        fft_len, nullptr, 1, plan.freq_len,
+                                        CUFFT_D2Z, local_entries_count,
+                                        &forward_work_bytes));
+
+        cufftSafeCall(cufftCreate(&plan.inverse_plan));
+        cufftSafeCall(cufftSetAutoAllocation(plan.inverse_plan, 0));
+        cufftSafeCall(cufftMakePlanMany(plan.inverse_plan, 1, n, nullptr, 1,
+                                        plan.freq_len, nullptr, 1, fft_len,
+                                        CUFFT_Z2D, local_entries_count,
+                                        &inverse_work_bytes));
+
+        cufft_work_bytes = std::max(cufft_work_bytes, forward_work_bytes);
+        cufft_work_bytes = std::max(cufft_work_bytes, inverse_work_bytes);
+        cufftSafeCall(cufftSetStream(plan.forward_plan, stream));
+        cufftSafeCall(cufftSetStream(plan.inverse_plan, stream));
+        plans.push_back(plan);
+    }
+
+    if (print_workspace_report_enabled())
+        std::cerr << memory_report();
+
+    const size_t real_count =
+        static_cast<size_t>(local_entries_count) * max_fft_len;
+    const size_t freq_count =
+        static_cast<size_t>(local_entries_count) * max_freq_len;
+    const size_t coeff_count =
+        static_cast<size_t>(num_blocks) * local_entries_count;
+
+    gpuErrchk(cudaMalloc((void **)&d_left_real, real_count * sizeof(double)));
+    gpuErrchk(cudaMalloc((void **)&d_right_real, real_count * sizeof(double)));
+    gpuErrchk(cudaMalloc((void **)&d_out_real, real_count * sizeof(double)));
+    gpuErrchk(cudaMalloc((void **)&d_entry_freq, freq_count * sizeof(ComplexD)));
+    gpuErrchk(cudaMalloc((void **)&d_left_gemm_freq,
+                         freq_count * sizeof(ComplexD)));
+    gpuErrchk(cudaMalloc((void **)&d_right_gemm_freq,
+                         freq_count * sizeof(ComplexD)));
+    gpuErrchk(cudaMalloc((void **)&d_out_gemm_freq,
+                         freq_count * sizeof(ComplexD)));
+    gpuErrchk(cudaMalloc((void **)&d_a_coeff, coeff_count * sizeof(double)));
+    gpuErrchk(cudaMalloc((void **)&d_h_coeff, coeff_count * sizeof(double)));
+
+    if (cufft_work_bytes > 0)
+    {
+        gpuErrchk(cudaMalloc(&d_cufft_work, cufft_work_bytes));
+        for (const PlanEntry &plan : plans)
+        {
+            cufftSafeCall(cufftSetWorkArea(plan.forward_plan, d_cufft_work));
+            cufftSafeCall(cufftSetWorkArea(plan.inverse_plan, d_cufft_work));
+        }
+    }
+}
+
+std::string BlockToeplitzInverseDistributedWorkspace::memory_report() const
+{
+    return build_distributed_layout_memory_report(
+        num_blocks, layout, cufft_work_bytes);
 }
 
 const BlockToeplitzInverseWorkspace::PlanEntry &

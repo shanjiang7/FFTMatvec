@@ -199,11 +199,43 @@ void pack_blocks_to_entry_real(const double *d_blocks, double *d_entry_real,
                                cudaStream_t s);
 
 /**
+ * @brief Reindex FFT entry-major frequency layout to GEMM frequency-major layout.
+ *
+ * d_entry_freq[e * freq_len + f] -> d_gemm_freq[f * entries + e].
+ * For a distributed local tile, entries = local_rows * local_cols and e is
+ * the column-major local tile entry.
+ */
+void entry_freq_to_gemm_layout(const ComplexD *d_entry_freq,
+                               ComplexD *d_gemm_freq, int freq_len,
+                               int entries, cudaStream_t s);
+
+/**
+ * @brief Reindex GEMM frequency-major layout back to FFT entry-major layout.
+ *
+ * d_gemm_freq[f * entries + e] -> d_entry_freq[e * freq_len + f].
+ */
+void gemm_freq_to_entry_layout(const ComplexD *d_gemm_freq,
+                               ComplexD *d_entry_freq, int freq_len,
+                               int entries, cudaStream_t s);
+
+/**
  * @brief Build V = 2I - U in entry-major real FFT layout after an unnormalized IFFT.
  */
 void build_newton_v_real(const double *d_u_ifft, double *d_v_real,
                          int out_len, int fft_len, int block_dim,
                          cudaStream_t s);
+
+/**
+ * @brief Local-tile version of V = 2I - U for a distributed r x r block.
+ *
+ * Only entries owned by this local tile are written. The 2I correction is
+ * applied only to entries whose global row equals global column.
+ */
+void build_newton_v_local_real(const double *d_u_ifft, double *d_v_real,
+                               int out_len, int fft_len,
+                               int local_row_start, int local_rows,
+                               int local_col_start, int local_cols,
+                               cudaStream_t s);
 
 /**
  * @brief Scale unnormalized IFFT output and store it as coefficient-major blocks.
