@@ -7,8 +7,39 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(__has_include)
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define BLOCK_TOEPLITZ_HAS_NVTX 1
+#endif
+#endif
+
+#ifndef BLOCK_TOEPLITZ_HAS_NVTX
+#define BLOCK_TOEPLITZ_HAS_NVTX 0
+#endif
+
 namespace
 {
+class NvtxRange
+{
+public:
+    explicit NvtxRange(const std::string &name)
+    {
+#if BLOCK_TOEPLITZ_HAS_NVTX
+        nvtxRangePushA(name.c_str());
+#else
+        (void)name;
+#endif
+    }
+
+    ~NvtxRange()
+    {
+#if BLOCK_TOEPLITZ_HAS_NVTX
+        nvtxRangePop();
+#endif
+    }
+};
+
 size_t block_entry(int block, int entry_count, int entry)
 {
     return static_cast<size_t>(block) * entry_count + entry;
@@ -397,6 +428,9 @@ void BlockToeplitzInverse::invert_preloaded_newton_gpu(
     {
         const int m_next = std::min(2 * m, num_blocks);
         const int fft_len = next_pow2(2 * m_next);
+        const NvtxRange range("newton_" + std::to_string(m) + "_to_" +
+                              std::to_string(m_next) + "_fft_" +
+                              std::to_string(fft_len));
         newton_step_gpu(m, m_next, block_dim, fft_len, workspace);
         m = m_next;
     }
