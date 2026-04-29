@@ -130,7 +130,7 @@ TEST(BlockToeplitzInverseTest, CpuReferenceResidual)
 {
     const int num_blocks = 8;
     const int block_dim = 3;
-    const std::vector<double> A = make_problem(num_blocks, block_dim);
+    const std::vector<double> A = make_normalized_problem(num_blocks, block_dim);
 
     const std::vector<double> H =
         BlockToeplitzInverse::invert_cpu_reference(A, num_blocks, block_dim);
@@ -144,6 +144,8 @@ TEST(BlockToeplitzInverseTest, GpuNewtonRequiresIdentityA0)
     const int block_dim = 2;
     const std::vector<double> A = make_problem(num_blocks, block_dim);
 
+    EXPECT_THROW(BlockToeplitzInverse::invert_cpu_reference(A, num_blocks, block_dim),
+                 std::invalid_argument);
     EXPECT_THROW(BlockToeplitzInverse::invert_newton_gpu(A, num_blocks, block_dim),
                  std::invalid_argument);
 }
@@ -210,7 +212,7 @@ TEST(BlockToeplitzInverseTest, BenchmarkNsysLarge)
     if (!cuda_available())
         GTEST_SKIP() << "CUDA device is not available.";
 
-    const int num_blocks = 2048;
+    const int num_blocks = 4096;
     const int block_dim = 256;
     const std::vector<double> A =
         make_normalized_problem(num_blocks, block_dim, 0.001);
@@ -228,7 +230,7 @@ TEST(BlockToeplitzInverseTest, BenchmarkNsysWarmLarge)
     if (!cuda_available())
         GTEST_SKIP() << "CUDA device is not available.";
 
-    const int num_blocks = 2048;
+    const int num_blocks = 4096;
     const int block_dim = 256;
     const std::vector<double> A =
         make_normalized_problem(num_blocks, block_dim, 0.001);

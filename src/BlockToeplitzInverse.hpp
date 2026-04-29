@@ -66,6 +66,9 @@ class BlockToeplitzInverse
 public:
     /**
      * @brief Compute the first column of A^{-1} using a direct CPU recurrence.
+     *
+     * This reference path follows the same normalized problem setting as the
+     * GPU path and requires A_0 = I.
      */
     static std::vector<double> invert_cpu_reference(
         const std::vector<double> &blocks, int num_blocks, int block_dim);
@@ -125,7 +128,6 @@ public:
     static int next_pow2(int n);
 
 private:
-    static std::vector<double> invert_block_cpu(const double *block, int block_dim);
     static void newton_step_gpu(
         int m, int m_next, int block_dim, int fft_len,
         BlockToeplitzInverseWorkspace &workspace);

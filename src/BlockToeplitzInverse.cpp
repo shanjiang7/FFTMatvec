@@ -218,87 +218,17 @@ int BlockToeplitzInverse::next_pow2(int n)
     return result;
 }
 
-std::vector<double> BlockToeplitzInverse::invert_block_cpu(
-    const double *block, int block_dim)
-{
-    const int width = 2 * block_dim;
-    std::vector<double> aug(static_cast<size_t>(block_dim) * width, 0.0);
-
-    for (int row = 0; row < block_dim; ++row)
-    {
-        for (int col = 0; col < block_dim; ++col)
-            aug[static_cast<size_t>(row) * width + col] =
-                block[cm_entry(row, col, block_dim)];
-        aug[static_cast<size_t>(row) * width + block_dim + row] = 1.0;
-    }
-
-    for (int pivot_col = 0; pivot_col < block_dim; ++pivot_col)
-    {
-        int pivot_row = pivot_col;
-        double pivot_abs = std::abs(aug[static_cast<size_t>(pivot_row) * width + pivot_col]);
-        for (int row = pivot_col + 1; row < block_dim; ++row)
-        {
-            const double candidate =
-                std::abs(aug[static_cast<size_t>(row) * width + pivot_col]);
-            if (candidate > pivot_abs)
-            {
-                pivot_abs = candidate;
-                pivot_row = row;
-            }
-        }
-
-        if (pivot_abs < 1e-14)
-            throw std::runtime_error("A_0 is singular or numerically singular.");
-
-        if (pivot_row != pivot_col)
-        {
-            for (int col = 0; col < width; ++col)
-            {
-                std::swap(aug[static_cast<size_t>(pivot_col) * width + col],
-                          aug[static_cast<size_t>(pivot_row) * width + col]);
-            }
-        }
-
-        const double pivot = aug[static_cast<size_t>(pivot_col) * width + pivot_col];
-        for (int col = 0; col < width; ++col)
-            aug[static_cast<size_t>(pivot_col) * width + col] /= pivot;
-
-        for (int row = 0; row < block_dim; ++row)
-        {
-            if (row == pivot_col)
-                continue;
-            const double factor = aug[static_cast<size_t>(row) * width + pivot_col];
-            if (factor == 0.0)
-                continue;
-            for (int col = 0; col < width; ++col)
-            {
-                aug[static_cast<size_t>(row) * width + col] -=
-                    factor * aug[static_cast<size_t>(pivot_col) * width + col];
-            }
-        }
-    }
-
-    std::vector<double> inverse(static_cast<size_t>(block_dim) * block_dim, 0.0);
-    for (int row = 0; row < block_dim; ++row)
-    {
-        for (int col = 0; col < block_dim; ++col)
-        {
-            inverse[cm_entry(row, col, block_dim)] =
-                aug[static_cast<size_t>(row) * width + block_dim + col];
-        }
-    }
-    return inverse;
-}
-
 std::vector<double> BlockToeplitzInverse::invert_cpu_reference(
     const std::vector<double> &blocks, int num_blocks, int block_dim)
 {
     validate_blocks(blocks, num_blocks, block_dim);
+    if (!is_identity_block(blocks.data(), block_dim, 1e-12))
+        throw std::invalid_argument(
+            "invert_cpu_reference expects normalized input with A_0 = I.");
 
     const int entries = block_dim * block_dim;
-    const std::vector<double> A0_inv = invert_block_cpu(blocks.data(), block_dim);
     std::vector<double> inverse(static_cast<size_t>(num_blocks) * entries, 0.0);
-    std::copy(A0_inv.begin(), A0_inv.end(), inverse.begin());
+    set_identity(inverse.data(), block_dim);
 
     std::vector<double> sum(entries, 0.0);
     std::vector<double> tmp(entries, 0.0);
@@ -317,10 +247,8 @@ std::vector<double> BlockToeplitzInverse::invert_cpu_reference(
         }
 
         double *H_k = inverse.data() + block_entry(k, entries, 0);
-        std::fill(tmp.begin(), tmp.end(), 0.0);
-        block_gemm_cpu(A0_inv.data(), sum.data(), tmp.data(), block_dim);
         for (int e = 0; e < entries; ++e)
-            H_k[e] = -tmp[e];
+            H_k[e] = -sum[e];
     }
 
     return inverse;
