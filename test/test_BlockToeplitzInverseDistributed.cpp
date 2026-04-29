@@ -3,7 +3,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <gtest/gtest.h>
+#include <iostream>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 int proc_rows = 1;
@@ -45,6 +49,49 @@ bool cuda_available()
 {
     int device_count = 0;
     return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
+}
+
+bool env_flag(const char *name)
+{
+    const char *value = std::getenv(name);
+    return value != nullptr && std::string(value) != "0";
+}
+
+int env_int(const char *name, int fallback)
+{
+    const char *value = std::getenv(name);
+    if (!value)
+        return fallback;
+    try
+    {
+        return std::stoi(value);
+    }
+    catch (const std::exception &)
+    {
+        throw std::invalid_argument(std::string("Invalid integer environment variable ") +
+                                    name + "=" + value);
+    }
+}
+
+double env_double(const char *name, double fallback)
+{
+    const char *value = std::getenv(name);
+    if (!value)
+        return fallback;
+    try
+    {
+        return std::stod(value);
+    }
+    catch (const std::exception &)
+    {
+        throw std::invalid_argument(std::string("Invalid floating-point environment variable ") +
+                                    name + "=" + value);
+    }
+}
+
+long double bytes_to_gib(long double bytes)
+{
+    return bytes / (1024.0L * 1024.0L * 1024.0L);
 }
 
 std::vector<ComplexD> make_local_tile(
@@ -153,6 +200,37 @@ std::vector<double> make_local_real_tile(
             }
         }
     }
+    return local;
+}
+
+std::vector<double> make_sparse_local_normalized_problem(
+    int num_blocks, const BlockToeplitzInverseDistributedLayout &layout,
+    double coeff_scale)
+{
+    const size_t local_entries = layout.local_entries();
+    std::vector<double> local(static_cast<size_t>(num_blocks) * local_entries,
+                              0.0);
+
+    for (int local_col = 0; local_col < layout.local_cols; ++local_col)
+    {
+        for (int local_row = 0; local_row < layout.local_rows; ++local_row)
+        {
+            const int global_row = layout.local_row_start + local_row;
+            const int global_col = layout.local_col_start + local_col;
+            const size_t entry = cm_entry(local_row, local_col, layout.local_rows);
+            if (global_row == global_col)
+                local[entry] = 1.0;
+
+            if (num_blocks > 1 && coeff_scale != 0.0)
+            {
+                local[local_entries + entry] =
+                    coeff_scale *
+                    (0.25 + 0.001 * (global_row + 1) -
+                     0.0005 * (global_col + 1));
+            }
+        }
+    }
+
     return local;
 }
 
@@ -339,6 +417,65 @@ TEST(BlockToeplitzInverseDistributedTest, NewtonMatchesCpuReference)
         for (size_t i = 0; i < expected.size(); ++i)
             EXPECT_NEAR(global_h[i], expected[i], 1e-8);
     }
+}
+
+TEST(BlockToeplitzInverseDistributedTest, DistributedLargeSmoke)
+{
+    if (!env_flag("BTI_RUN_DISTRIBUTED_LARGE_TEST"))
+        GTEST_SKIP() << "Set BTI_RUN_DISTRIBUTED_LARGE_TEST=1 to run the "
+                        "large distributed Newton smoke test.";
+    if (!cuda_available())
+        GTEST_SKIP() << "CUDA device is not available.";
+    if (proc_rows != proc_cols)
+        GTEST_SKIP() << "Large distributed smoke test requires a square process grid.";
+
+    Comm comm(MPI_COMM_WORLD, proc_rows, proc_cols);
+    const int num_blocks = env_int("BTI_BENCH_T", 8192);
+    const int block_dim = env_int("BTI_BENCH_R", 400);
+    const double coeff_scale = env_double("BTI_BENCH_COEFF_SCALE", 0.0);
+    const BlockToeplitzInverseDistributedLayout layout =
+        BlockToeplitzInverseDistributedLayout::create(
+            block_dim, proc_rows, proc_cols,
+            comm.get_row_color(), comm.get_col_color());
+
+    if (comm.get_world_rank() == 0)
+    {
+        const long double local_coeff_bytes =
+            static_cast<long double>(num_blocks) * layout.local_entries() *
+            sizeof(double);
+        std::cerr << "\n[BlockToeplitzInverseDistributedLargeSmoke]\n"
+                  << "  num_blocks:       " << num_blocks << "\n"
+                  << "  global_block_dim: " << block_dim << "\n"
+                  << "  process_grid:     " << proc_rows << " x "
+                  << proc_cols << "\n"
+                  << "  rank0_local_entries: " << layout.local_entries() << "\n"
+                  << "  rank0_local_coeff_host: "
+                  << static_cast<double>(bytes_to_gib(local_coeff_bytes))
+                  << " GiB\n";
+    }
+
+    BlockToeplitzInverseDistributedWorkspace workspace;
+    workspace.setup_for_problem(num_blocks, layout, comm.get_stream());
+    if (env_flag("BTI_DIST_REPORT_ONLY"))
+        return;
+
+    std::vector<double> local_a =
+        make_sparse_local_normalized_problem(num_blocks, layout, coeff_scale);
+    BlockToeplitzInverse::load_coefficients_distributed_gpu(
+        local_a, num_blocks, layout, workspace);
+    gpuErrchk(cudaStreamSynchronize(comm.get_stream()));
+    std::vector<double>().swap(local_a);
+
+    MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+    const double start = MPI_Wtime();
+    BlockToeplitzInverse::invert_preloaded_newton_distributed_gpu(
+        num_blocks, layout, workspace, comm);
+    gpuErrchk(cudaStreamSynchronize(comm.get_stream()));
+    MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+    const double end = MPI_Wtime();
+
+    if (comm.get_world_rank() == 0)
+        std::cerr << "  distributed_newton_time_s: " << (end - start) << "\n";
 }
 
 int main(int argc, char **argv)
