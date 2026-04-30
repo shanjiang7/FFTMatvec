@@ -42,6 +42,8 @@ plugins:
 nav:
   - Getting Started: "getting_started.md"
   - I/O and Data Formats: "io_format.md"
+  - Single-GPU Block Toeplitz Inverse: "block_toeplitz_inverse_single_gpu.md"
+  - Block Toeplitz Inverse Benchmarks: "benchmark_result.md"
   - pyFFTMatvec: "python_bindings.md"
   - API Reference:
     - "Classes":

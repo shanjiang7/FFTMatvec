@@ -43,6 +43,9 @@ For a code-level walkthrough of the single-GPU block Toeplitz inverse prototype,
 see the [Single-GPU Block Toeplitz Inverse](block_toeplitz_inverse_single_gpu.md)
 guide.
 
+For benchmark plots and profiling notes, see the
+[Block Toeplitz Inverse Benchmark Results](benchmark_result.md) report.
+
 ## pyFFTMatvec
 
 For using FFTMatvec from Python — including installation, the `pyFFTMatvec` API, and PyTorch GPU integration — see the [pyFFTMatvec](python_bindings.md) guide.
@@ -50,4 +53,3 @@ For using FFTMatvec from Python — including installation, the `pyFFTMatvec` AP
 ## License
 
 This code is released under the MIT License. See [LICENSE](license.md) for more information.
-
