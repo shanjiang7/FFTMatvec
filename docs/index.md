@@ -37,6 +37,12 @@ To learn how to build and run the code, along with a working example, see the [G
 
 To learn how matrices and vectors are stored on disk (HDF5 format, directory layout, and data ordering), see the [I/O and Data Format](io_format.md) guide.
 
+## Block Toeplitz Inverse
+
+For a code-level walkthrough of the single-GPU block Toeplitz inverse prototype,
+see the [Single-GPU Block Toeplitz Inverse](block_toeplitz_inverse_single_gpu.md)
+guide.
+
 ## pyFFTMatvec
 
 For using FFTMatvec from Python — including installation, the `pyFFTMatvec` API, and PyTorch GPU integration — see the [pyFFTMatvec](python_bindings.md) guide.
@@ -44,5 +50,4 @@ For using FFTMatvec from Python — including installation, the `pyFFTMatvec` AP
 ## License
 
 This code is released under the MIT License. See [LICENSE](license.md) for more information.
-
 
